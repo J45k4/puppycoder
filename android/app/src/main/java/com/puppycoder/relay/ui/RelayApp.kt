@@ -1,5 +1,10 @@
 package com.puppycoder.relay.ui
 
+import android.content.Intent
+import android.net.Uri
+import android.provider.Settings
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -36,6 +41,7 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Button
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -73,6 +79,7 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -102,6 +109,7 @@ import com.puppycoder.relay.data.SshTunnelProfile
 import com.puppycoder.relay.data.ToolActivity
 import com.puppycoder.relay.data.ToolActivityState
 import com.puppycoder.relay.data.TunnelRouteRule
+import com.puppycoder.relay.update.AppUpdateState
 import com.puppycoder.relay.ui.theme.RelayAmber
 import com.puppycoder.relay.ui.theme.RelayGreen
 import com.puppycoder.relay.ui.theme.RelayRed
@@ -132,7 +140,9 @@ fun RelayApp(viewModel: PuppyCoderViewModel = viewModel()) {
     val chatSortOrder by viewModel.chatSortOrder.collectAsState()
     val chatGroupMode by viewModel.chatGroupMode.collectAsState()
     val collapsedChatGroups by viewModel.collapsedChatGroups.collectAsState()
+    val appUpdate by viewModel.appUpdate.collectAsState()
     val snackbar = remember { SnackbarHostState() }
+    val context = LocalContext.current
     var screen by rememberSaveable { mutableStateOf(MainScreen.CHATS) }
     var searchActive by rememberSaveable { mutableStateOf(false) }
     var showNewChat by rememberSaveable { mutableStateOf(false) }
@@ -141,6 +151,17 @@ fun RelayApp(viewModel: PuppyCoderViewModel = viewModel()) {
     var showAddTunnel by rememberSaveable { mutableStateOf(false) }
     var addRouteTunnelId by rememberSaveable { mutableStateOf<String?>(null) }
     var showChatArrangement by rememberSaveable { mutableStateOf(false) }
+    var showUpdatePrompt by rememberSaveable { mutableStateOf(false) }
+    var promptedUpdateVersion by rememberSaveable { mutableStateOf<String?>(null) }
+    val unknownSourcesLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) {
+        if (context.packageManager.canRequestPackageInstalls()) {
+            viewModel.installDownloadedUpdate()
+        } else {
+            viewModel.reportInstallPermissionDenied()
+        }
+    }
     val openAddComputer: (RelayServer?) -> Unit = { draft ->
         computerDraft = draft
         showAddComputer = true
@@ -155,6 +176,13 @@ fun RelayApp(viewModel: PuppyCoderViewModel = viewModel()) {
 
     LaunchedEffect(Unit) {
         viewModel.notices.collect { snackbar.showSnackbar(it) }
+    }
+    LaunchedEffect(appUpdate) {
+        val ready = appUpdate as? AppUpdateState.Ready ?: return@LaunchedEffect
+        if (promptedUpdateVersion != ready.release.version) {
+            promptedUpdateVersion = ready.release.version
+            showUpdatePrompt = true
+        }
     }
     LaunchedEffect(screen, conversation?.id, computers.map { it.id to it.endpoint }) {
         if (screen == MainScreen.CHATS && conversation == null && computers.isNotEmpty()) {
@@ -187,21 +215,41 @@ fun RelayApp(viewModel: PuppyCoderViewModel = viewModel()) {
             onSelectModel = viewModel::selectModel,
             historyLoading = historyLoadingChatId == conversation?.id,
             snackbar = snackbar,
+            appUpdate = appUpdate,
+            onUpdateAction = {
+                when (appUpdate) {
+                    is AppUpdateState.Ready -> showUpdatePrompt = true
+                    is AppUpdateState.Failed -> viewModel.retryUpdateDownload()
+                    else -> Unit
+                }
+            },
         )
     } else {
         Scaffold(
             snackbarHost = { SnackbarHost(snackbar) },
             topBar = {
-                AppHeader(
-                    showingSettings = screen == MainScreen.SETTINGS,
-                    onSortClick = { showChatArrangement = true },
-                    onSearchClick = { searchActive = true },
-                    onSettingsClick = {
-                        searchActive = false
-                        viewModel.setChatSearchQuery("")
-                        screen = if (screen == MainScreen.SETTINGS) MainScreen.CHATS else MainScreen.SETTINGS
-                    },
-                )
+                Column {
+                    AppHeader(
+                        showingSettings = screen == MainScreen.SETTINGS,
+                        onSortClick = { showChatArrangement = true },
+                        onSearchClick = { searchActive = true },
+                        onSettingsClick = {
+                            searchActive = false
+                            viewModel.setChatSearchQuery("")
+                            screen = if (screen == MainScreen.SETTINGS) MainScreen.CHATS else MainScreen.SETTINGS
+                        },
+                    )
+                    UpdateBanner(
+                        state = appUpdate,
+                        onAction = {
+                            when (appUpdate) {
+                                is AppUpdateState.Ready -> showUpdatePrompt = true
+                                is AppUpdateState.Failed -> viewModel.retryUpdateDownload()
+                                else -> Unit
+                            }
+                        },
+                    )
+                }
             },
             floatingActionButton = {
                 ExtendedFloatingActionButton(
@@ -324,6 +372,76 @@ fun RelayApp(viewModel: PuppyCoderViewModel = viewModel()) {
             onGroupModeChange = viewModel::setChatGroupMode,
             onDismiss = { showChatArrangement = false },
         )
+    }
+
+    val readyUpdate = appUpdate as? AppUpdateState.Ready
+    if (showUpdatePrompt && readyUpdate != null) {
+        AlertDialog(
+            onDismissRequest = { showUpdatePrompt = false },
+            title = { Text("Install PuppyCoder ${readyUpdate.release.version}?") },
+            text = {
+                Text("The update finished downloading and its SHA-256 checksum was verified. Android will ask you to approve the installation.")
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showUpdatePrompt = false
+                        if (context.packageManager.canRequestPackageInstalls()) {
+                            viewModel.installDownloadedUpdate()
+                        } else {
+                            unknownSourcesLauncher.launch(
+                                Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES).apply {
+                                    data = Uri.parse("package:${context.packageName}")
+                                },
+                            )
+                        }
+                    },
+                ) { Text("Install") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showUpdatePrompt = false }) { Text("Later") }
+            },
+        )
+    }
+}
+
+@Composable
+private fun UpdateBanner(state: AppUpdateState, onAction: () -> Unit) {
+    val content = when (state) {
+        is AppUpdateState.Downloading -> Triple(
+            "Update ${state.release.version} available",
+            state.progressPercent?.let { "Downloading · $it%" } ?: "Starting download…",
+            false,
+        )
+        is AppUpdateState.Ready -> Triple(
+            "Update ${state.release.version} ready",
+            "Tap to install",
+            true,
+        )
+        is AppUpdateState.Failed -> Triple(
+            "Update ${state.release.version} available",
+            "Download failed · Tap to retry",
+            true,
+        )
+        else -> return
+    }
+    Surface(
+        color = MaterialTheme.colorScheme.tertiaryContainer,
+        modifier = Modifier.fillMaxWidth().clickable(enabled = content.third, onClick = onAction),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 9.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            if (state is AppUpdateState.Downloading) {
+                CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.width(10.dp))
+            }
+            Column(Modifier.weight(1f)) {
+                Text(content.first, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold)
+                Text(content.second, style = MaterialTheme.typography.labelSmall)
+            }
+        }
     }
 }
 
@@ -647,6 +765,8 @@ private fun ConversationScreen(
     onSelectModel: (AgentModel?) -> Unit,
     historyLoading: Boolean,
     snackbar: SnackbarHostState,
+    appUpdate: AppUpdateState,
+    onUpdateAction: () -> Unit,
 ) {
     var draft by rememberSaveable(conversation.id) { mutableStateOf("") }
     val listState = rememberLazyListState()
@@ -665,49 +785,52 @@ private fun ConversationScreen(
         modifier = Modifier.edgeSwipeBack(onBack),
         snackbarHost = { SnackbarHost(snackbar) },
         topBar = {
-            Surface(shadowElevation = 2.dp) {
-                Row(
-                    modifier = Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 6.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
-                    }
-                    computer?.let { ComputerAvatar(it, size = 38) }
-                    Spacer(Modifier.width(10.dp))
-                    Column(Modifier.weight(1f)) {
-                        Text(conversation.title, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.SemiBold)
-                        Text(
-                            if (busy) "Agent working on $computerName…" else "$computerName · ${conversation.workspace}",
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = if (busy) RelayGreen else MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                        Row(
-                            modifier = Modifier
-                                .clickable(enabled = !busy && computer != null) { showModelPicker = true }
-                                .padding(top = 2.dp, bottom = 2.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
+            Column {
+                Surface(shadowElevation = 2.dp) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 6.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        IconButton(onClick = onBack) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                        }
+                        computer?.let { ComputerAvatar(it, size = 38) }
+                        Spacer(Modifier.width(10.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(conversation.title, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.SemiBold)
                             Text(
-                                "Model: ${conversation.modelDisplayName ?: "Server default"}",
+                                if (busy) "Agent working on $computerName…" else "$computerName · ${conversation.workspace}",
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis,
-                                style = MaterialTheme.typography.labelMedium,
-                                color = if (busy) MaterialTheme.colorScheme.onSurfaceVariant else RelayGreen,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (busy) RelayGreen else MaterialTheme.colorScheme.onSurfaceVariant,
                             )
-                            if (!busy) Text(" ▾", color = RelayGreen, style = MaterialTheme.typography.labelMedium)
+                            Row(
+                                modifier = Modifier
+                                    .clickable(enabled = !busy && computer != null) { showModelPicker = true }
+                                    .padding(top = 2.dp, bottom = 2.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                Text(
+                                    "Model: ${conversation.modelDisplayName ?: "Server default"}",
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = if (busy) MaterialTheme.colorScheme.onSurfaceVariant else RelayGreen,
+                                )
+                                if (!busy) Text(" ▾", color = RelayGreen, style = MaterialTheme.typography.labelMedium)
+                            }
                         }
-                    }
-                    if (busy) {
-                        TextButton(onClick = onStop) {
-                            Icon(Icons.Default.Close, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(Modifier.width(4.dp))
-                            Text("Stop")
+                        if (busy) {
+                            TextButton(onClick = onStop) {
+                                Icon(Icons.Default.Close, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(4.dp))
+                                Text("Stop")
+                            }
                         }
                     }
                 }
+                UpdateBanner(appUpdate, onUpdateAction)
             }
         },
         bottomBar = {

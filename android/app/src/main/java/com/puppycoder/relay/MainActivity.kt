@@ -15,4 +15,9 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    override fun onResume() {
+        super.onResume()
+        (application as PuppyCoderApplication).updateManager.checkForUpdates()
+    }
 }

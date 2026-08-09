@@ -15,6 +15,7 @@ import com.puppycoder.relay.data.RemoteResult
 import com.puppycoder.relay.data.SshTunnelProfile
 import com.puppycoder.relay.data.ToolActivity
 import com.puppycoder.relay.data.TunnelRouteRule
+import com.puppycoder.relay.update.AppUpdateState
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -29,6 +30,7 @@ import kotlinx.coroutines.launch
 class PuppyCoderViewModel(application: Application) : AndroidViewModel(application) {
 
     private val repository = (application as PuppyCoderApplication).repository
+    private val updateManager = (application as PuppyCoderApplication).updateManager
     private val chatListPreferences = application.getSharedPreferences("chat_list_preferences", 0)
     private val selectedChatId = MutableStateFlow<String?>(null)
     private val _notices = MutableSharedFlow<String>(extraBufferCapacity = 4)
@@ -52,6 +54,7 @@ class PuppyCoderViewModel(application: Application) : AndroidViewModel(applicati
     )
 
     val notices = _notices.asSharedFlow()
+    val appUpdate: StateFlow<AppUpdateState> = updateManager.state
     val modelPicker: StateFlow<ModelPickerState> = _modelPicker
     val chatSync: StateFlow<ChatSyncState> = _chatSync
     val historyLoadingChatId: StateFlow<String?> = _historyLoadingChatId
@@ -322,6 +325,20 @@ class PuppyCoderViewModel(application: Application) : AndroidViewModel(applicati
         computers.value.firstOrNull { it.id == id }?.let {
             saveComputer(it.copy(state = ConnectionState.OFFLINE))
         }
+    }
+
+    fun retryUpdateDownload() {
+        updateManager.retryDownload()
+    }
+
+    fun installDownloadedUpdate() {
+        updateManager.installDownloadedUpdate().onFailure { error ->
+            _notices.tryEmit(error.message ?: "Could not open the Android installer")
+        }
+    }
+
+    fun reportInstallPermissionDenied() {
+        _notices.tryEmit("Installation permission is required to update PuppyCoder")
     }
 }
 

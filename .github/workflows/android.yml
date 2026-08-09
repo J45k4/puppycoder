@@ -1,0 +1,173 @@
+name: Android CI/CD
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - 'android-v*'
+    paths:
+      - 'android/**'
+      - '.github/workflows/android.yml'
+  pull_request:
+    branches:
+      - master
+    paths:
+      - 'android/**'
+      - '.github/workflows/android.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    name: Test and build APK
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-provider: basic
+
+      - name: Test, lint, and build debug APK
+        run: ./gradlew testDebugUnitTest lintDebug assembleDebug --no-daemon
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: puppycoder-android-debug-${{ github.sha }}
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Validate release tag
+        if: startsWith(github.ref, 'refs/tags/android-v')
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#android-v}"
+          if [[ ! "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+            echo "Android release tags must use android-vMAJOR.MINOR.PATCH" >&2
+            exit 1
+          fi
+
+          major=$((10#${BASH_REMATCH[1]}))
+          minor=$((10#${BASH_REMATCH[2]}))
+          patch=$((10#${BASH_REMATCH[3]}))
+          if (( minor > 999 || patch > 999 )); then
+            echo "Minor and patch versions must be at most 999" >&2
+            exit 1
+          fi
+
+          version_code=$((major * 1000000 + minor * 1000 + patch))
+          if (( version_code < 1 || version_code > 2100000000 )); then
+            echo "Calculated Android version code is out of range" >&2
+            exit 1
+          fi
+
+          echo "PUPPYCODER_VERSION_NAME=$version" >> "$GITHUB_ENV"
+          echo "PUPPYCODER_VERSION_CODE=$version_code" >> "$GITHUB_ENV"
+
+      - name: Prepare release keystore
+        if: startsWith(github.ref, 'refs/tags/android-v')
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          for value in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [[ -z "${!value}" ]]; then
+              echo "Missing required GitHub Actions secret: $value" >&2
+              exit 1
+            fi
+          done
+
+          keystore="$RUNNER_TEMP/puppycoder-release.jks"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          if [[ ! -s "$keystore" ]]; then
+            echo "Decoded release keystore is empty" >&2
+            exit 1
+          fi
+          echo "ANDROID_KEYSTORE_PATH=$keystore" >> "$GITHUB_ENV"
+
+      - name: Build signed release APK
+        if: startsWith(github.ref, 'refs/tags/android-v')
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          PUPPYCODER_REQUIRE_SIGNING: 'true'
+        run: ./gradlew assembleRelease --no-daemon
+
+      - name: Verify and package release APK
+        if: startsWith(github.ref, 'refs/tags/android-v')
+        shell: bash
+        run: |
+          mkdir -p dist
+          apk="dist/puppycoder-${GITHUB_REF_NAME}.apk"
+          cp app/build/outputs/apk/release/app-release.apk "$apk"
+
+          apksigner="$(find "$ANDROID_HOME/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
+          if [[ -z "$apksigner" ]]; then
+            echo "Could not locate apksigner" >&2
+            exit 1
+          fi
+          "$apksigner" verify --verbose --print-certs "$apk"
+          sha256sum "$apk" > "$apk.sha256"
+
+      - name: Upload release APK
+        if: startsWith(github.ref, 'refs/tags/android-v')
+        uses: actions/upload-artifact@v7
+        with:
+          name: puppycoder-android-release-${{ github.ref_name }}
+          path: |
+            android/dist/puppycoder-${{ github.ref_name }}.apk
+            android/dist/puppycoder-${{ github.ref_name }}.apk.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/android-v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+
+      - name: Download signed APK
+        uses: actions/download-artifact@v8
+        with:
+          name: puppycoder-android-release-${{ github.ref_name }}
+          path: dist
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag \
+            --generate-notes \
+            --title "PuppyCoder Android ${GITHUB_REF_NAME#android-v}"

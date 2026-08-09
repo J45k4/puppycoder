@@ -5,6 +5,7 @@ import com.puppycoder.relay.data.ChatRepository
 import com.puppycoder.relay.data.ConversationRemoteClient
 import com.puppycoder.relay.data.PuppyCoderDatabase
 import com.puppycoder.relay.data.SecretStore
+import com.puppycoder.relay.update.AppUpdateManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -12,6 +13,10 @@ import kotlinx.coroutines.launch
 
 class PuppyCoderApplication : Application() {
     private val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    val updateManager: AppUpdateManager by lazy {
+        AppUpdateManager(this, applicationScope)
+    }
 
     val repository: ChatRepository by lazy {
         ChatRepository(
@@ -25,5 +30,6 @@ class PuppyCoderApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         applicationScope.launch { repository.initialize() }
+        updateManager.start()
     }
 }

@@ -44,6 +44,28 @@ adb reverse tcp:4310 tcp:4310
   -Pandroid.testInstrumentationRunnerArguments.liveWorkspace=/absolute/path/to/workspace
 ```
 
+## CI and Android releases
+
+The `Android CI/CD` GitHub Actions workflow runs unit tests, lint, and a debug APK build for Android changes on `master` and pull requests. The debug APK is retained as a workflow artifact for 14 days.
+
+Signed GitHub Releases are created from tags named `android-vMAJOR.MINOR.PATCH`. Before creating the first release, add these repository Actions secrets:
+
+- `ANDROID_KEYSTORE_BASE64`: the release JKS/keystore file encoded as a single-line Base64 value.
+- `ANDROID_KEYSTORE_PASSWORD`: the keystore password.
+- `ANDROID_KEY_ALIAS`: the signing-key alias.
+- `ANDROID_KEY_PASSWORD`: the signing-key password.
+
+Keep the keystore and passwords outside the repository and back them up securely. Every future update must use the same signing key. To publish version `0.3.9`:
+
+```bash
+git tag android-v0.3.9
+git push origin android-v0.3.9
+```
+
+The workflow derives Android `versionName` and monotonically ordered `versionCode` values from the tag, verifies the APK signature, and attaches the signed APK plus its SHA-256 checksum to the GitHub Release.
+
+The Android app checks GitHub for published `android-vMAJOR.MINOR.PATCH` releases when it starts. When a newer version exists, Android's `DownloadManager` downloads the APK in the background and the app shows update progress at the top of every screen. After the APK checksum is verified, PuppyCoder prompts before opening Android's package installer. Android 8 and newer may first ask the user to allow PuppyCoder as an installation source; installation always requires explicit system confirmation.
+
 ## Agent servers
 
 Keep agent listeners on loopback or another trusted private network. OpenCode is unsecured unless `OPENCODE_SERVER_PASSWORD` is configured.
