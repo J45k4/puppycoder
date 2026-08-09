@@ -1,0 +1,208 @@
+package com.puppycoder.relay.data
+
+import android.content.Context
+import androidx.room.Room
+import androidx.test.core.app.ApplicationProvider
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import org.junit.After
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Before
+import org.junit.Test
+import org.junit.runner.RunWith
+
+@RunWith(AndroidJUnit4::class)
+class ChatRepositoryTest {
+    private lateinit var database: PuppyCoderDatabase
+    private lateinit var repository: ChatRepository
+    private lateinit var client: FakeConversationClient
+
+    @Before
+    fun setUp() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        database = Room.inMemoryDatabaseBuilder(context, PuppyCoderDatabase::class.java).build()
+        client = FakeConversationClient()
+        repository = ChatRepository(context, database.chatDao(), client, SecretStore())
+    }
+
+    @After
+    fun tearDown() {
+        runBlocking { repository.shutdown() }
+        database.close()
+    }
+
+    @Test
+    fun optimisticMessageIsStoredBeforeRemoteAcceptanceThenStreamsReply() = runBlocking {
+        val computer = RelayServer(
+            id = "computer-1",
+            name = "Codex computer",
+            kind = ServerKind.CODEX,
+            endpoint = "ws://127.0.0.1:4310",
+            workspace = "/workspace",
+            routeMode = ServerRouteMode.DIRECT,
+        )
+        repository.saveComputer(computer)
+        val conversationId = repository.createConversation(computer.id, computer.workspace)
+        repository.selectModel(
+            conversationId,
+            AgentModel(modelId = "gpt-test", displayName = "GPT Test"),
+        )
+
+        val messageId = repository.sendMessage(conversationId, "Hello agent")
+        val optimistic = repository.messages(conversationId).first { it.isNotEmpty() }.single()
+        assertEquals(messageId, optimistic.id)
+        assertEquals("Hello agent", optimistic.body)
+        assertTrue(optimistic.deliveryState == DeliveryState.QUEUED || optimistic.deliveryState == DeliveryState.SENDING)
+
+        client.release.complete(Unit)
+        val completed = withTimeout(5_000) {
+            repository.messages(conversationId).first { messages ->
+                messages.any { it.role == MessageRole.ASSISTANT && it.deliveryState == DeliveryState.DELIVERED }
+            }
+        }
+        assertEquals("Hi from the agent", completed.first { it.role == MessageRole.ASSISTANT }.body)
+        assertEquals(DeliveryState.DELIVERED, completed.first { it.role == MessageRole.USER }.deliveryState)
+        assertEquals("gpt-test", client.lastRequest?.modelId)
+        assertEquals("GPT Test", repository.conversation(conversationId).first()?.modelDisplayName)
+    }
+
+    @Test
+    fun routesCanBeAddedAndRemovedFromAnExistingTunnel() = runBlocking {
+        val tunnel = SshTunnelProfile(
+            id = "tunnel-1",
+            name = "Gateway",
+            ssh = SshTunnelConfig(host = "gateway.example", username = "puppy", password = "secret"),
+            routes = listOf(TunnelRouteRule("127.0.0.1", 4310)),
+        )
+        repository.saveTunnel(tunnel)
+
+        repository.addTunnelRoute(tunnel.id, TunnelRouteRule("*.internal", 4096))
+        val withNewRoute = repository.tunnels.first { it.firstOrNull()?.routes?.size == 2 }.single()
+        assertEquals(TunnelRouteRule("*.internal", 4096), withNewRoute.routes.last())
+        assertTrue(
+            runCatching {
+                repository.addTunnelRoute(tunnel.id, TunnelRouteRule("*.INTERNAL", 4096))
+            }.isFailure,
+        )
+
+        repository.deleteTunnelRoute(tunnel.id, TunnelRouteRule("*.internal", 4096))
+        val withOneRoute = repository.tunnels.first { it.firstOrNull()?.routes?.size == 1 }.single()
+        assertEquals(listOf(TunnelRouteRule("127.0.0.1", 4310)), withOneRoute.routes)
+        assertTrue(
+            runCatching { repository.deleteTunnelRoute(tunnel.id, withOneRoute.routes.single()) }.isFailure,
+        )
+    }
+
+    @Test
+    fun remoteChatsAndHistoryAreImportedWithoutDuplicates() = runBlocking {
+        val computer = RelayServer(
+            id = "computer-1",
+            name = "Codex computer",
+            kind = ServerKind.CODEX,
+            endpoint = "ws://127.0.0.1:4310",
+            workspace = "/workspace",
+            routeMode = ServerRouteMode.DIRECT,
+        )
+        repository.saveComputer(computer)
+        client.remoteConversations = listOf(
+            RemoteConversationSummary(
+                remoteId = "thread-remote",
+                title = "Existing server chat",
+                workspace = "/remote/workspace",
+                preview = "Hello from the server",
+                modelId = "gpt-test",
+                createdAt = 1_000,
+                updatedAt = 2_000,
+            ),
+        )
+        client.remoteMessages = listOf(
+            RemoteChatMessage("user-remote", MessageRole.USER, "Hello", 1_100),
+            RemoteChatMessage("assistant-remote", MessageRole.ASSISTANT, "Hi there", 1_200),
+        )
+
+        assertEquals(1, repository.syncRemoteChats().conversationsSeen)
+        assertEquals(1, repository.syncRemoteChats().conversationsSeen)
+        val importedChat = repository.chats.first { it.size == 1 }.single().conversation
+        assertEquals("thread-remote", importedChat.remoteConversationId)
+        assertEquals("Existing server chat", importedChat.title)
+        assertEquals("/remote/workspace", importedChat.workspace)
+
+        assertEquals(2, (repository.syncConversationHistory(importedChat.id) as RemoteResult.Success).value)
+        assertEquals(0, (repository.syncConversationHistory(importedChat.id) as RemoteResult.Success).value)
+        val messages = repository.messages(importedChat.id).first { it.size == 2 }
+        assertEquals(listOf("Hello", "Hi there"), messages.map(ChatMessage::body))
+        assertTrue(messages.all { it.deliveryState == DeliveryState.DELIVERED })
+        assertEquals(importedChat.id, repository.searchChats("Existing server").first().single().conversation.id)
+        assertEquals(importedChat.id, repository.searchChats("Hi there").first().single().conversation.id)
+        assertTrue(repository.searchChats("does not exist").first().isEmpty())
+    }
+
+    @Test
+    fun discoveredAgentServicesAreAddedAutomaticallyWithoutDuplicates() = runBlocking {
+        val tunnel = SshTunnelProfile(
+            id = "ssh-computer",
+            name = "Workstation",
+            ssh = SshTunnelConfig(host = "workstation.example", username = "puppy", password = "secret"),
+            routes = listOf(TunnelRouteRule("127.0.0.1", 4310)),
+        )
+        repository.saveTunnel(tunnel)
+        val found = listOf(
+            DiscoveredAgentServer(
+                kind = ServerKind.CODEX,
+                endpoint = "ws://127.0.0.1:4310",
+                suggestedName = "Workstation · Codex",
+                suggestedWorkspace = "/home/puppy",
+                version = "Ready",
+                latencyMs = 12,
+            ),
+        )
+
+        assertEquals(1, repository.saveDiscoveredServers(tunnel.id, found))
+        assertEquals(0, repository.saveDiscoveredServers(tunnel.id, found))
+        val service = repository.computers.first { it.size == 1 }.single()
+        assertEquals(ServerKind.CODEX, service.kind)
+        assertEquals(ServerRouteMode.TUNNEL, service.routeMode)
+        assertEquals(tunnel.id, service.tunnelProfileId)
+        assertEquals("/home/puppy", service.workspace)
+    }
+}
+
+private class FakeConversationClient : AgentConversationClient {
+    val release = CompletableDeferred<Unit>()
+    @Volatile var lastRequest: SendMessageRequest? = null
+    var remoteConversations: List<RemoteConversationSummary> = emptyList()
+    var remoteMessages: List<RemoteChatMessage> = emptyList()
+
+    override suspend fun send(
+        computer: RelayServer,
+        request: SendMessageRequest,
+        onEvent: (AgentConversationEvent) -> Unit,
+    ) {
+        lastRequest = request
+        release.await()
+        onEvent(AgentConversationEvent.Accepted("thread-1", "turn-1", request.clientMessageId))
+        onEvent(AgentConversationEvent.AgentWorking)
+        onEvent(AgentConversationEvent.AssistantDelta("Hi from the agent", "assistant-1"))
+        onEvent(AgentConversationEvent.Completed)
+    }
+
+    override suspend fun stop(computer: RelayServer, conversationId: String) = RemoteResult.Success(Unit)
+    override suspend fun check(computer: RelayServer) = RemoteResult.Success(RemoteCheck("test", 1, "Direct"))
+    override suspend fun listModels(computer: RelayServer) = RemoteResult.Success(
+        listOf(AgentModel("gpt-test", "GPT Test")),
+    )
+    override suspend fun listConversations(computer: RelayServer) = RemoteResult.Success(remoteConversations)
+    override suspend fun loadConversation(computer: RelayServer, remoteConversationId: String) =
+        RemoteResult.Success(remoteMessages)
+    override suspend fun testTunnel(profile: SshTunnelProfile, computerEndpoints: List<String>) =
+        RemoteResult.Success(SshTunnelTest("ok", 1))
+    override suspend fun discoverServers(profile: SshTunnelProfile) =
+        RemoteResult.Success(emptyList<DiscoveredAgentServer>())
+    override fun setTunnelProfiles(profiles: List<SshTunnelProfile>) = Unit
+    override fun closeTunnelProfile(profileId: String) = Unit
+    override fun close() = Unit
+}

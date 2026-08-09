@@ -1,0 +1,13 @@
+[Unit]
+Description=Codex app-server WebSocket for PuppyCoder
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/codex app-server --listen ws://127.0.0.1:4310
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGINT
+
+[Install]
+WantedBy=default.target
