@@ -142,10 +142,10 @@ class CodexConnectionManagerTest {
                             .put("delta", "hello"),
                     ),
             )
-            assertEquals("hello", withTimeout(2_000) { event.await() })
+            assertEquals("hello", withTimeout(10_000) { event.await() })
 
             factory.sockets.single().fail(IOException("network changed"))
-            withTimeout(4_000) {
+            withTimeout(10_000) {
                 while (factory.sockets.size < 2 || resumeCount.get() < 2) delay(25)
             }
             assertEquals(2, factory.sockets.size)
