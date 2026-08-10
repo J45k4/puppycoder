@@ -55,7 +55,17 @@ Signed GitHub Releases are created from tags named `android-vMAJOR.MINOR.PATCH`.
 - `ANDROID_KEY_ALIAS`: the signing-key alias.
 - `ANDROID_KEY_PASSWORD`: the signing-key password.
 
-Keep the keystore and passwords outside the repository and back them up securely. Every future update must use the same signing key. To publish version `0.3.9`:
+Keep the keystore and passwords outside the repository and back them up securely. Every future update must use the same signing key.
+
+For the first release, generate the signing identity and its GitHub secret values in a secure directory outside the repository:
+
+```bash
+./ops/create-release-signing.sh /secure/backup/puppycoder-android-signing
+```
+
+The script creates a JKS and a mode-`600` `github-actions-secrets.env` recovery file without printing secret values. Add `--github-repo J45k4/puppycoder` to upload all four repository Actions secrets with the authenticated GitHub CLI. The script refuses to overwrite an existing identity or write it inside the Git repository.
+
+Then publish version `0.3.9`:
 
 ```bash
 git tag android-v0.3.9
