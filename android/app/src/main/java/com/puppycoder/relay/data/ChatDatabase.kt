@@ -260,6 +260,9 @@ interface ChatDao {
     @Query("SELECT * FROM tool_activity WHERE conversationId = :conversationId ORDER BY createdAt, id")
     fun observeTools(conversationId: String): Flow<List<ToolActivityEntity>>
 
+    @Query("SELECT * FROM tool_activity WHERE id = :id")
+    suspend fun getTool(id: String): ToolActivityEntity?
+
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertTool(tool: ToolActivityEntity)
 

@@ -347,6 +347,49 @@ class ConversationRemoteClient(
                         val turnTime = turn.optLong("startedAt").takeIf { it > 0 }?.times(1_000L)
                             ?: (fallbackTime + turnIndex * 1_000L)
                         val items = turn.optJSONArray("items") ?: JSONArray()
+                        val finalAgentIndex = (0 until items.length())
+                            .filter { items.optJSONObject(it)?.optString("type") == "agentMessage" }
+                            .let { agentIndexes ->
+                                agentIndexes.lastOrNull { index ->
+                                    items.optJSONObject(index)?.optString("phase") == "final_answer"
+                                } ?: agentIndexes.lastOrNull()
+                            }
+                        val activities = buildList {
+                            for (itemIndex in 0 until items.length()) {
+                                val item = items.optJSONObject(itemIndex) ?: continue
+                                val type = item.optString("type")
+                                val activity = when {
+                                    type == "agentMessage" && itemIndex != finalAgentIndex -> {
+                                        val text = item.optString("text").trim()
+                                        if (text.isBlank()) null else RemoteChatActivity(
+                                            remoteId = "agent-update:${item.optString("id", "$turnIndex:$itemIndex")}",
+                                            title = "Agent update",
+                                            detail = text,
+                                            createdAt = turnTime + itemIndex,
+                                            replacesMessageRemoteId = item.optString("id").takeIf(String::isNotBlank),
+                                        )
+                                    }
+                                    type == "reasoning" -> RemoteChatActivity(
+                                        remoteId = item.optString("id", "reasoning:$turnIndex:$itemIndex"),
+                                        title = "Thinking",
+                                        detail = item.reasoningSummary(),
+                                        createdAt = turnTime + itemIndex,
+                                    )
+                                    type !in setOf("userMessage", "agentMessage", "hookPrompt") && type.isNotBlank() -> {
+                                        val status = item.optString("status")
+                                        RemoteChatActivity(
+                                            remoteId = item.optString("id", "$type:$turnIndex:$itemIndex"),
+                                            title = type.conversationHumanize(),
+                                            detail = item.historicalActivityDetail(),
+                                            failed = status in setOf("failed", "declined", "error"),
+                                            createdAt = turnTime + itemIndex,
+                                        )
+                                    }
+                                    else -> null
+                                }
+                                activity?.let(::add)
+                            }
+                        }
                         for (itemIndex in 0 until items.length()) {
                             val item = items.getJSONObject(itemIndex)
                             val body = when (item.optString("type")) {
@@ -359,7 +402,7 @@ class ConversationRemoteClient(
                                         }
                                     }.filter(String::isNotBlank).joinToString("\n")
                                 }
-                                "agentMessage" -> item.optString("text")
+                                "agentMessage" -> if (itemIndex == finalAgentIndex) item.optString("text") else ""
                                 else -> ""
                             }.trim()
                             if (body.isBlank()) continue
@@ -372,6 +415,18 @@ class ConversationRemoteClient(
                                     role = role,
                                     body = body,
                                     createdAt = turnTime + itemIndex,
+                                    activities = if (itemIndex == finalAgentIndex) activities else emptyList(),
+                                ),
+                            )
+                        }
+                        if (finalAgentIndex == null && activities.isNotEmpty()) {
+                            add(
+                                RemoteChatMessage(
+                                    remoteId = "$remoteConversationId:$turnIndex:activities",
+                                    role = MessageRole.ASSISTANT,
+                                    body = "",
+                                    createdAt = turnTime + items.length(),
+                                    activities = activities,
                                 ),
                             )
                         }
@@ -404,15 +459,63 @@ class ConversationRemoteClient(
                         else -> continue
                     }
                     val parts = entry.optJSONArray("parts") ?: JSONArray()
-                    val body = buildList {
-                        for (partIndex in 0 until parts.length()) {
-                            val part = parts.optJSONObject(partIndex) ?: continue
-                            if (part.optString("type") == "text") add(part.optString("text"))
-                        }
-                    }.filter(String::isNotBlank).joinToString("\n").trim()
-                    if (body.isBlank()) continue
                     val time = info.optJSONObject("time") ?: JSONObject()
                     val createdAt = time.optLong("created", System.currentTimeMillis())
+                    val textPartIndexes = (0 until parts.length()).filter { index ->
+                        val part = parts.optJSONObject(index)
+                        part?.optString("type") == "text" && part.optString("text").isNotBlank()
+                    }
+                    val finalTextPartIndex = textPartIndexes.lastOrNull()
+                    val body = if (role == MessageRole.USER) {
+                        textPartIndexes.joinToString("\n") { index ->
+                            parts.getJSONObject(index).optString("text")
+                        }.trim()
+                    } else {
+                        finalTextPartIndex?.let { parts.getJSONObject(it).optString("text").trim() }.orEmpty()
+                    }
+                    val activities = if (role == MessageRole.ASSISTANT) {
+                        buildList {
+                            for (partIndex in 0 until parts.length()) {
+                                val part = parts.optJSONObject(partIndex) ?: continue
+                                val type = part.optString("type")
+                                val partTime = part.optJSONObject("time")?.optLong("start", createdAt + partIndex)
+                                    ?: (createdAt + partIndex)
+                                val activity = when {
+                                    type == "text" && partIndex != finalTextPartIndex -> {
+                                        part.optString("text").trim().takeIf(String::isNotBlank)?.let { text ->
+                                            RemoteChatActivity(
+                                                remoteId = "agent-update:${part.optString("id", "$index:$partIndex")}",
+                                                title = "Agent update",
+                                                detail = text,
+                                                createdAt = partTime,
+                                            )
+                                        }
+                                    }
+                                    type == "reasoning" -> RemoteChatActivity(
+                                        remoteId = part.optString("id", "reasoning:$index:$partIndex"),
+                                        title = "Thinking",
+                                        detail = part.optString("text"),
+                                        createdAt = partTime,
+                                    )
+                                    type == "tool" -> {
+                                        val state = part.optJSONObject("state") ?: JSONObject()
+                                        RemoteChatActivity(
+                                            remoteId = part.optString("callID", part.optString("id", "tool:$index:$partIndex")),
+                                            title = part.optString("tool", "Tool").conversationHumanize(),
+                                            detail = state.openCodeToolDetail(),
+                                            failed = state.optString("status") == "error",
+                                            createdAt = partTime,
+                                        )
+                                    }
+                                    else -> null
+                                }
+                                activity?.let(::add)
+                            }
+                        }
+                    } else {
+                        emptyList()
+                    }
+                    if (body.isBlank() && activities.isEmpty()) continue
                     add(
                         RemoteChatMessage(
                             remoteId = info.optString("id").ifBlank { "$remoteConversationId:$index" },
@@ -420,6 +523,7 @@ class ConversationRemoteClient(
                             body = body,
                             createdAt = createdAt,
                             updatedAt = time.optLong("completed", createdAt),
+                            activities = activities,
                         ),
                     )
                 }
@@ -513,6 +617,7 @@ class ConversationRemoteClient(
         val terminal = AtomicBoolean(false)
         val accepted = AtomicBoolean(false)
         val completion = CompletableDeferred<Unit>()
+        val reasoningSummaries = ConcurrentHashMap<String, ConcurrentHashMap<Int, String>>()
         var turnId: String? = null
         val connection = codexConnections.connection(
             computer.id,
@@ -555,6 +660,16 @@ class ConversationRemoteClient(
                             )
                         }
                     }
+                    "item/reasoning/summaryTextDelta" -> {
+                        val itemId = params?.optString("itemId").orEmpty()
+                        val delta = params?.optString("delta").orEmpty()
+                        if (itemId.isNotBlank() && delta.isNotEmpty()) {
+                            val summaryIndex = params?.optInt("summaryIndex") ?: 0
+                            val parts = reasoningSummaries.getOrPut(itemId) { ConcurrentHashMap() }
+                            parts.compute(summaryIndex) { _, current -> current.orEmpty() + delta }
+                            onEvent(AgentConversationEvent.ThinkingDelta(itemId, delta))
+                        }
+                    }
                     "item/started" -> {
                         val item = params?.optJSONObject("item") ?: return@runCatching
                         val type = item.optString("type")
@@ -562,7 +677,7 @@ class ConversationRemoteClient(
                             onEvent(
                                 AgentConversationEvent.ToolStarted(
                                     item.optString("id", type),
-                                    type.conversationHumanize(),
+                                    if (type == "reasoning") "Thinking" else type.conversationHumanize(),
                                     item.optString("command"),
                                 ),
                             )
@@ -572,12 +687,24 @@ class ConversationRemoteClient(
                         val item = params?.optJSONObject("item") ?: return@runCatching
                         val type = item.optString("type")
                         if (type != "agentMessage" && type.isNotBlank()) {
+                            val itemId = item.optString("id", type)
                             val status = item.optString("status")
+                            val detail = if (type == "reasoning") {
+                                item.reasoningSummary().ifBlank {
+                                    reasoningSummaries[itemId]
+                                        ?.toSortedMap()
+                                        ?.values
+                                        ?.joinToString("\n\n")
+                                        .orEmpty()
+                                }
+                            } else {
+                                status
+                            }
                             onEvent(
                                 AgentConversationEvent.ToolCompleted(
-                                    item.optString("id", type),
-                                    type.conversationHumanize(),
-                                    status,
+                                    itemId,
+                                    if (type == "reasoning") "Thinking" else type.conversationHumanize(),
+                                    detail,
                                     status == "failed" || status == "declined",
                                 ),
                             )
@@ -634,6 +761,7 @@ class ConversationRemoteClient(
         onEvent: (AgentConversationEvent) -> Unit,
     ) = withContext(Dispatchers.IO) {
         val accepted = AtomicBoolean(false)
+        val reasoningPartIds = ConcurrentHashMap.newKeySet<String>()
         val base = endpoint.conversationHttpBase()
         val sessionId = request.remoteConversationId ?: runCatching {
             val create = computer.authorizedRequest(
@@ -726,7 +854,14 @@ class ConversationRemoteClient(
                             if (!line.startsWith("data:")) continue
                             runCatching { JSONObject(line.removePrefix("data:").trim()) }
                                 .onSuccess { event ->
-                                    handleOpenCodeEvent(event, sessionId, accepted.get(), onEvent, ::finish)
+                                    handleOpenCodeEvent(
+                                        event,
+                                        sessionId,
+                                        accepted.get(),
+                                        reasoningPartIds,
+                                        onEvent,
+                                        ::finish,
+                                    )
                                 }
                         }
                         if (!terminal.get()) {
@@ -747,6 +882,7 @@ class ConversationRemoteClient(
         event: JSONObject,
         sessionId: String,
         accepted: Boolean,
+        reasoningPartIds: MutableSet<String>,
         onEvent: (AgentConversationEvent) -> Unit,
         finish: (AgentConversationEvent) -> Unit,
     ) {
@@ -754,33 +890,59 @@ class ConversationRemoteClient(
         if (properties.optString("sessionID") != sessionId) return
         when (event.optString("type")) {
             "message.part.delta" -> if (properties.optString("field") == "text") {
-                onEvent(
-                    AgentConversationEvent.AssistantDelta(
-                        properties.optString("delta"),
-                        properties.optString("messageID").takeIf(String::isNotBlank),
-                    ),
-                )
-            }
-            "message.part.updated" -> {
-                val part = properties.optJSONObject("part") ?: return
-                if (part.optString("type") != "tool") return
-                val id = part.optString("callID", part.optString("id"))
-                val title = part.optString("tool", "Tool").conversationHumanize()
-                val state = part.optJSONObject("state")
-                when (state?.optString("status")) {
-                    "pending", "running" -> onEvent(AgentConversationEvent.ToolStarted(id, title))
-                    "completed" -> onEvent(AgentConversationEvent.ToolCompleted(id, title))
-                    "error" -> onEvent(
-                        AgentConversationEvent.ToolCompleted(
-                            id,
-                            title,
-                            state.optString("error"),
-                            failed = true,
+                val partId = properties.optString("partID")
+                val delta = properties.optString("delta")
+                if (partId in reasoningPartIds) {
+                    onEvent(AgentConversationEvent.ThinkingDelta(partId, delta))
+                } else {
+                    onEvent(
+                        AgentConversationEvent.AssistantDelta(
+                            delta,
+                            properties.optString("messageID").takeIf(String::isNotBlank),
                         ),
                     )
                 }
             }
+            "message.part.updated" -> {
+                val part = properties.optJSONObject("part") ?: return
+                when (part.optString("type")) {
+                    "reasoning" -> {
+                        val id = part.optString("id")
+                        if (id.isBlank()) return
+                        reasoningPartIds += id
+                        val detail = part.optString("text")
+                        val completed = part.optJSONObject("time")?.let { time ->
+                            time.has("end") && !time.isNull("end")
+                        } == true
+                        if (completed) {
+                            onEvent(AgentConversationEvent.ToolCompleted(id, "Thinking", detail))
+                        } else {
+                            onEvent(AgentConversationEvent.ToolStarted(id, "Thinking"))
+                        }
+                    }
+                    "tool" -> {
+                        val id = part.optString("callID", part.optString("id"))
+                        val title = part.optString("tool", "Tool").conversationHumanize()
+                        val state = part.optJSONObject("state")
+                        when (state?.optString("status")) {
+                            "pending", "running" -> onEvent(AgentConversationEvent.ToolStarted(id, title))
+                            "completed" -> onEvent(AgentConversationEvent.ToolCompleted(id, title))
+                            "error" -> onEvent(
+                                AgentConversationEvent.ToolCompleted(
+                                    id,
+                                    title,
+                                    state.optString("error"),
+                                    failed = true,
+                                ),
+                            )
+                        }
+                    }
+                }
+            }
             "session.idle" -> if (accepted) {
+                reasoningPartIds.forEach { id ->
+                    onEvent(AgentConversationEvent.ToolCompleted(id, "Thinking"))
+                }
                 // OpenCode publishes idle just before its prompt loop has fully unwound.
                 // Let that cleanup finish before a FIFO outbox starts the next prompt.
                 scope.launch {
@@ -796,6 +958,36 @@ class ConversationRemoteClient(
                 ),
             )
         }
+    }
+
+    private fun JSONObject.reasoningSummary(): String {
+        val summary = optJSONArray("summary") ?: return ""
+        return buildList {
+            for (index in 0 until summary.length()) {
+                summary.optString(index).takeIf(String::isNotBlank)?.let(::add)
+            }
+        }.joinToString("\n\n")
+    }
+
+    private fun JSONObject.historicalActivityDetail(): String {
+        val primary = sequenceOf("command", "query", "path", "text", "status")
+            .map(::optString)
+            .firstOrNull(String::isNotBlank)
+            .orEmpty()
+        val output = optString("aggregatedOutput")
+        return listOf(primary, output)
+            .filter(String::isNotBlank)
+            .distinct()
+            .joinToString("\n\n")
+    }
+
+    private fun JSONObject.openCodeToolDetail(): String {
+        val error = optString("error")
+        if (error.isNotBlank()) return error
+        val output = optString("output")
+        if (output.isNotBlank()) return output
+        val input = opt("input") ?: return optString("status")
+        return if (input is String) input else input.toString()
     }
 
     override fun close() {

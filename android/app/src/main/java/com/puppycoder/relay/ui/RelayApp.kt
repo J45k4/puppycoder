@@ -8,6 +8,8 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -36,6 +38,8 @@ import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
@@ -76,7 +80,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalContext
@@ -89,6 +97,7 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.unit.Velocity
 import androidx.activity.compose.BackHandler
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.puppycoder.relay.R
@@ -773,9 +782,16 @@ private fun ConversationScreen(
     val computerName = computer?.name ?: "Computer"
     val busy = conversation.state == ConversationState.WORKING || conversation.state == ConversationState.SENDING
     var showModelPicker by rememberSaveable(conversation.id) { mutableStateOf(false) }
+    val arrangedMessages = remember(messages, tools) { arrangeMessageActivities(messages, tools) }
 
-    LaunchedEffect(messages.size, messages.lastOrNull()?.body) {
-        if (messages.isNotEmpty()) listState.animateScrollToItem(messages.lastIndex)
+    LaunchedEffect(
+        messages.size,
+        messages.lastOrNull()?.body,
+        tools.size,
+        tools.lastOrNull()?.updatedAt,
+    ) {
+        val itemCount = arrangedMessages.groups.size + if (arrangedMessages.unboundActivities.isEmpty()) 0 else 1
+        if (itemCount > 0) listState.animateScrollToItem(itemCount - 1)
     }
     LaunchedEffect(computer?.id) {
         computer?.id?.let { onLoadModels(it, false) }
@@ -853,7 +869,7 @@ private fun ConversationScreen(
             verticalArrangement = Arrangement.spacedBy(8.dp),
             contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 16.dp),
         ) {
-            if (messages.isEmpty()) {
+            if (arrangedMessages.groups.isEmpty() && arrangedMessages.unboundActivities.isEmpty()) {
                 item {
                     Surface(
                         modifier = Modifier.fillMaxWidth().padding(top = 40.dp),
@@ -879,17 +895,24 @@ private fun ConversationScreen(
                     }
                 }
             }
-            items(messages, key = ChatMessage::id) { message ->
+            items(arrangedMessages.groups, key = { it.message.id }) { group ->
+                val message = group.message
                 MessageBubble(
                     message = message,
+                    activities = group.activities,
                     computerName = computerName,
                     onRetry = { onRetry(message.id) },
                     onRemove = { onRemove(message.id) },
                 )
-                tools.filter { it.messageId == message.id }.forEach { ToolCard(it) }
             }
-            val unboundTools = tools.filter { tool -> messages.none { it.id == tool.messageId } }
-            items(unboundTools, key = ToolActivity::id) { ToolCard(it) }
+            if (arrangedMessages.unboundActivities.isNotEmpty()) {
+                item(key = "unbound-thinking") {
+                    ThinkingBlock(
+                        activities = arrangedMessages.unboundActivities,
+                        groupKey = "${conversation.id}-unbound",
+                    )
+                }
+            }
             if (conversation.state == ConversationState.WORKING && messages.lastOrNull()?.deliveryState != DeliveryState.STREAMING) {
                 item { TypingIndicator(computerName) }
             }
@@ -1017,6 +1040,7 @@ private fun ModelOptionRow(title: String, subtitle: String, selected: Boolean, o
 @Composable
 private fun MessageBubble(
     message: ChatMessage,
+    activities: List<ToolActivity>,
     computerName: String,
     onRetry: () -> Unit,
     onRemove: () -> Unit,
@@ -1036,10 +1060,28 @@ private fun MessageBubble(
             ),
             color = if (outgoing) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
         ) {
-            MarkdownMessage(
-                text = message.body,
-                modifier = Modifier.padding(horizontal = 14.dp, vertical = 11.dp),
-            )
+            if (outgoing) {
+                MarkdownMessage(
+                    text = message.body,
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 11.dp),
+                )
+            } else {
+                Column(Modifier.padding(horizontal = 10.dp, vertical = 10.dp)) {
+                    if (activities.isNotEmpty()) {
+                        ThinkingBlock(
+                            activities = activities,
+                            groupKey = message.id,
+                        )
+                        if (message.body.isNotBlank()) Spacer(Modifier.height(10.dp))
+                    }
+                    if (message.body.isNotBlank()) {
+                        MarkdownMessage(
+                            text = message.body,
+                            modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp),
+                        )
+                    }
+                }
+            }
         }
         Spacer(Modifier.height(3.dp))
         if (outgoing) {
@@ -1117,26 +1159,122 @@ private fun TypingIndicator(computerName: String) {
 }
 
 @Composable
-private fun ToolCard(tool: ToolActivity) {
-    val running = tool.state == ToolActivityState.RUNNING
+private fun ThinkingBlock(
+    activities: List<ToolActivity>,
+    groupKey: String,
+    modifier: Modifier = Modifier,
+) {
+    val active = activities.any { it.state == ToolActivityState.RUNNING }
+    val failed = activities.any { it.state == ToolActivityState.FAILED }
+    val traceScrollState = rememberScrollState()
+    val containedScrollConnection = remember(groupKey) {
+        object : NestedScrollConnection {
+            private var childConsumedInGesture = false
+
+            override fun onPostScroll(
+                consumed: Offset,
+                available: Offset,
+                source: NestedScrollSource,
+            ): Offset {
+                if (consumed.y != 0f) childConsumedInGesture = true
+                return if (childConsumedInGesture) Offset(0f, available.y) else Offset.Zero
+            }
+
+            override suspend fun onPostFling(consumed: Velocity, available: Velocity): Velocity {
+                val containRemainder = childConsumedInGesture
+                childConsumedInGesture = false
+                return if (containRemainder) available else Velocity.Zero
+            }
+        }
+    }
+    var expanded by rememberSaveable(groupKey) { mutableStateOf(active) }
+    LaunchedEffect(active) { expanded = active }
+
     Surface(
-        modifier = Modifier.fillMaxWidth(.92f).padding(start = 4.dp),
+        modifier = modifier.fillMaxWidth(),
         shape = RoundedCornerShape(12.dp),
         border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
-        color = MaterialTheme.colorScheme.surface,
+        color = MaterialTheme.colorScheme.surface.copy(alpha = .72f),
     ) {
-        Row(Modifier.padding(11.dp), verticalAlignment = Alignment.CenterVertically) {
-            if (running) CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
-            else Icon(
-                if (tool.state == ToolActivityState.FAILED) Icons.Default.Close else Icons.Default.Check,
+        Column {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { expanded = !expanded }
+                    .padding(horizontal = 11.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                if (active) {
+                    CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                } else {
+                    Icon(
+                        if (failed) Icons.Default.Close else Icons.Default.Check,
+                        contentDescription = null,
+                        modifier = Modifier.size(17.dp),
+                        tint = if (failed) RelayRed else RelayGreen,
+                    )
+                }
+                Spacer(Modifier.width(9.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        if (active) "Thinking…" else "Thinking",
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Text(
+                        if (activities.size == 1) "1 activity" else "${activities.size} activities",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Icon(
+                    if (expanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                    contentDescription = if (expanded) "Collapse thinking" else "Expand thinking",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (expanded) {
+                HorizontalDivider()
+                Column(
+                    Modifier
+                        .heightIn(max = 360.dp)
+                        .nestedScroll(containedScrollConnection)
+                        .verticalScroll(traceScrollState)
+                        .padding(horizontal = 11.dp, vertical = 4.dp),
+                ) {
+                    activities.forEachIndexed { index, activity ->
+                        ThinkingActivityRow(activity)
+                        if (index != activities.lastIndex) HorizontalDivider(Modifier.padding(start = 26.dp))
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ThinkingActivityRow(activity: ToolActivity) {
+    val running = activity.state == ToolActivityState.RUNNING
+    Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.Top) {
+        if (running) {
+            CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 1.8.dp)
+        } else {
+            Icon(
+                if (activity.state == ToolActivityState.FAILED) Icons.Default.Close else Icons.Default.Check,
                 contentDescription = null,
-                modifier = Modifier.size(17.dp),
-                tint = if (tool.state == ToolActivityState.FAILED) RelayRed else RelayGreen,
+                modifier = Modifier.size(15.dp),
+                tint = if (activity.state == ToolActivityState.FAILED) RelayRed else RelayGreen,
             )
-            Spacer(Modifier.width(9.dp))
-            Column {
-                Text(tool.title, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Medium)
-                if (tool.detail.isNotBlank()) Text(tool.detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Spacer(Modifier.width(9.dp))
+        Column(Modifier.weight(1f)) {
+            Text(activity.title, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Medium)
+            if (activity.detail.isNotBlank()) {
+                Text(
+                    activity.detail,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         }
     }

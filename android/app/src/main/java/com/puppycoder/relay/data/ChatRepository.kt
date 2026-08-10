@@ -96,15 +96,23 @@ class ChatRepository(
             is RemoteResult.Error -> result
             is RemoteResult.Success -> {
                 val existingMessages = dao.getMessages(conversationId)
-                val existingRemoteIds = buildSet {
-                    existingMessages.forEach { message ->
-                        add(message.id)
-                        message.remoteMessageId?.let(::add)
-                    }
-                }
-                val imported = result.value
-                    .filter { it.remoteId !in existingRemoteIds }
-                    .map { remote ->
+                val replacedRemoteIds = result.value
+                    .flatMap(RemoteChatMessage::activities)
+                    .mapNotNull(RemoteChatActivity::replacesMessageRemoteId)
+                    .toSet()
+                existingMessages
+                    .filter { it.remoteMessageId in replacedRemoteIds }
+                    .forEach { dao.deleteMessage(it.id) }
+
+                val retainedMessages = existingMessages.filterNot { it.remoteMessageId in replacedRemoteIds }
+                val existingByRemoteId = retainedMessages.mapNotNull { message ->
+                    message.remoteMessageId?.let { it to message }
+                }.toMap().toMutableMap()
+                var importedCount = 0
+
+                result.value.forEach { remote ->
+                    val existing = existingByRemoteId[remote.remoteId]
+                    val local = if (existing == null) {
                         ChatMessage(
                             id = UUID.nameUUIDFromBytes(
                                 "remote-message:$conversationId:${remote.remoteId}".toByteArray(),
@@ -116,10 +124,44 @@ class ChatRepository(
                             remoteMessageId = remote.remoteId,
                             createdAt = remote.createdAt,
                             updatedAt = remote.updatedAt,
-                        ).toEntity()
+                        ).toEntity().also {
+                            dao.insertMessagesIfMissing(listOf(it))
+                            importedCount += 1
+                            existingByRemoteId[remote.remoteId] = it
+                        }
+                    } else {
+                        val updated = existing.copy(
+                            role = remote.role.name,
+                            body = remote.body,
+                            deliveryState = DeliveryState.DELIVERED.name,
+                            updatedAt = maxOf(existing.updatedAt, remote.updatedAt),
+                        )
+                        dao.updateMessage(updated)
+                        updated
                     }
-                dao.insertMessagesIfMissing(imported)
-                result.value.lastOrNull()?.let { latest ->
+
+                    remote.activities.forEach { activity ->
+                        dao.upsertTool(
+                            ToolActivityEntity(
+                                id = UUID.nameUUIDFromBytes(
+                                    "remote-activity:$conversationId:${activity.remoteId}".toByteArray(),
+                                ).toString(),
+                                conversationId = conversationId,
+                                messageId = local.id,
+                                title = activity.title,
+                                detail = activity.detail,
+                                state = if (activity.failed) {
+                                    ToolActivityState.FAILED.name
+                                } else {
+                                    ToolActivityState.COMPLETED.name
+                                },
+                                createdAt = activity.createdAt,
+                                updatedAt = remote.updatedAt,
+                            ),
+                        )
+                    }
+                }
+                result.value.lastOrNull { it.body.isNotBlank() }?.let { latest ->
                     val current = dao.getConversation(conversationId) ?: conversation
                     dao.updateConversation(
                         current.copy(
@@ -128,7 +170,7 @@ class ChatRepository(
                         ),
                     )
                 }
-                RemoteResult.Success(imported.size)
+                RemoteResult.Success(importedCount)
             }
         }
     }
@@ -488,10 +530,28 @@ class ChatRepository(
                         ),
                     )
                 } else {
+                    val startsNewSegment = !event.remoteMessageId.isNullOrBlank() &&
+                        !current.remoteMessageId.isNullOrBlank() &&
+                        event.remoteMessageId != current.remoteMessageId
+                    if (startsNewSegment && current.body.isNotBlank()) {
+                        dao.upsertTool(
+                            ToolActivityEntity(
+                                id = "$assistantId-message-${current.remoteMessageId}",
+                                conversationId = outgoing.conversationId,
+                                messageId = assistantId,
+                                title = "Agent update",
+                                detail = current.body,
+                                state = ToolActivityState.COMPLETED.name,
+                                createdAt = current.createdAt,
+                                updatedAt = now,
+                            ),
+                        )
+                    }
                     dao.updateMessage(
                         current.copy(
-                            body = current.body + event.text,
+                            body = if (startsNewSegment) event.text else current.body + event.text,
                             deliveryState = DeliveryState.STREAMING.name,
+                            remoteMessageId = event.remoteMessageId ?: current.remoteMessageId,
                             updatedAt = now,
                         ),
                     )
@@ -504,29 +564,50 @@ class ChatRepository(
                     ),
                 )
             }
-            is AgentConversationEvent.ToolStarted -> dao.upsertTool(
-                ToolActivityEntity(
-                    id = "${outgoing.id}-${event.id}",
-                    conversationId = outgoing.conversationId,
-                    messageId = assistantId,
-                    title = event.title,
-                    detail = event.detail,
-                    state = ToolActivityState.RUNNING.name,
-                    createdAt = now,
-                    updatedAt = now,
-                ),
-            )
-            is AgentConversationEvent.ToolCompleted -> {
+            is AgentConversationEvent.ThinkingDelta -> {
                 val id = "${outgoing.id}-${event.id}"
+                val current = dao.getTool(id)
+                dao.upsertTool(
+                    ToolActivityEntity(
+                        id = id,
+                        conversationId = outgoing.conversationId,
+                        messageId = assistantId,
+                        title = "Thinking",
+                        detail = current?.detail.orEmpty() + event.text,
+                        state = ToolActivityState.RUNNING.name,
+                        createdAt = current?.createdAt ?: now,
+                        updatedAt = now,
+                    ),
+                )
+            }
+            is AgentConversationEvent.ToolStarted -> {
+                val id = "${outgoing.id}-${event.id}"
+                val current = dao.getTool(id)
                 dao.upsertTool(
                     ToolActivityEntity(
                         id = id,
                         conversationId = outgoing.conversationId,
                         messageId = assistantId,
                         title = event.title,
-                        detail = event.detail,
+                        detail = event.detail.ifBlank { current?.detail.orEmpty() },
+                        state = ToolActivityState.RUNNING.name,
+                        createdAt = current?.createdAt ?: now,
+                        updatedAt = now,
+                    ),
+                )
+            }
+            is AgentConversationEvent.ToolCompleted -> {
+                val id = "${outgoing.id}-${event.id}"
+                val current = dao.getTool(id)
+                dao.upsertTool(
+                    ToolActivityEntity(
+                        id = id,
+                        conversationId = outgoing.conversationId,
+                        messageId = assistantId,
+                        title = event.title,
+                        detail = event.detail.ifBlank { current?.detail.orEmpty() },
                         state = if (event.failed) ToolActivityState.FAILED.name else ToolActivityState.COMPLETED.name,
-                        createdAt = now,
+                        createdAt = current?.createdAt ?: now,
                         updatedAt = now,
                     ),
                 )

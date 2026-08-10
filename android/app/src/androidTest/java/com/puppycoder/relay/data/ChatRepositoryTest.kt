@@ -71,6 +71,51 @@ class ChatRepositoryTest {
     }
 
     @Test
+    fun groupsReasoningToolsAndProgressWhileKeepingFinalResponseSeparate() = runBlocking {
+        val computer = RelayServer(
+            id = "computer-1",
+            name = "Codex computer",
+            kind = ServerKind.CODEX,
+            endpoint = "ws://127.0.0.1:4310",
+            workspace = "/workspace",
+            routeMode = ServerRouteMode.DIRECT,
+        )
+        repository.saveComputer(computer)
+        val conversationId = repository.createConversation(computer.id, computer.workspace)
+        client.sendEvents = listOf(
+            AgentConversationEvent.Accepted("thread-1", "turn-1", "user-remote"),
+            AgentConversationEvent.AgentWorking,
+            AgentConversationEvent.ThinkingDelta("reasoning-1", "Inspecting the project"),
+            AgentConversationEvent.ToolCompleted("reasoning-1", "Thinking"),
+            AgentConversationEvent.ToolStarted("shell-1", "Shell", "rg --files"),
+            AgentConversationEvent.ToolCompleted("shell-1", "Shell"),
+            AgentConversationEvent.AssistantDelta("I found the relevant files.", "progress-1"),
+            AgentConversationEvent.AssistantDelta("The final response stays visible.", "final-1"),
+            AgentConversationEvent.Completed,
+        )
+
+        repository.sendMessage(conversationId, "Inspect it")
+        client.release.complete(Unit)
+
+        val messages = withTimeout(5_000) {
+            repository.messages(conversationId).first { current ->
+                current.any { it.role == MessageRole.ASSISTANT && it.deliveryState == DeliveryState.DELIVERED }
+            }
+        }
+        val activities = withTimeout(5_000) {
+            repository.tools(conversationId).first { current ->
+                current.size == 3 && current.all { it.state == ToolActivityState.COMPLETED }
+            }
+        }
+
+        assertEquals("The final response stays visible.", messages.first { it.role == MessageRole.ASSISTANT }.body)
+        assertEquals(setOf("Thinking", "Shell", "Agent update"), activities.map(ToolActivity::title).toSet())
+        assertEquals("Inspecting the project", activities.first { it.title == "Thinking" }.detail)
+        assertEquals("rg --files", activities.first { it.title == "Shell" }.detail)
+        assertEquals("I found the relevant files.", activities.first { it.title == "Agent update" }.detail)
+    }
+
+    @Test
     fun routesCanBeAddedAndRemovedFromAnExistingTunnel() = runBlocking {
         val tunnel = SshTunnelProfile(
             id = "tunnel-1",
@@ -142,6 +187,69 @@ class ChatRepositoryTest {
     }
 
     @Test
+    fun existingHistoryIsBackfilledIntoActivityBlock() = runBlocking {
+        val computer = RelayServer(
+            id = "computer-1",
+            name = "Codex computer",
+            kind = ServerKind.CODEX,
+            endpoint = "ws://127.0.0.1:4310",
+            workspace = "/workspace",
+            routeMode = ServerRouteMode.DIRECT,
+        )
+        repository.saveComputer(computer)
+        client.remoteConversations = listOf(
+            RemoteConversationSummary(
+                remoteId = "thread-remote",
+                title = "Existing chat",
+                workspace = "/workspace",
+                createdAt = 1_000,
+                updatedAt = 2_000,
+            ),
+        )
+        client.remoteMessages = listOf(
+            RemoteChatMessage("user-remote", MessageRole.USER, "Inspect it", 1_100),
+            RemoteChatMessage("progress-remote", MessageRole.ASSISTANT, "I am checking.", 1_200),
+            RemoteChatMessage("final-remote", MessageRole.ASSISTANT, "Everything looks good.", 1_300),
+        )
+        repository.syncRemoteChats()
+        val chat = repository.chats.first { it.size == 1 }.single().conversation
+        assertEquals(3, (repository.syncConversationHistory(chat.id) as RemoteResult.Success).value)
+
+        client.remoteMessages = listOf(
+            RemoteChatMessage("user-remote", MessageRole.USER, "Inspect it", 1_100),
+            RemoteChatMessage(
+                remoteId = "final-remote",
+                role = MessageRole.ASSISTANT,
+                body = "Everything looks good.",
+                createdAt = 1_300,
+                activities = listOf(
+                    RemoteChatActivity(
+                        remoteId = "agent-update:progress-remote",
+                        title = "Agent update",
+                        detail = "I am checking.",
+                        createdAt = 1_200,
+                        replacesMessageRemoteId = "progress-remote",
+                    ),
+                    RemoteChatActivity(
+                        remoteId = "reasoning-remote",
+                        title = "Thinking",
+                        detail = "Checked the relevant files.",
+                        createdAt = 1_250,
+                    ),
+                ),
+            ),
+        )
+
+        assertEquals(0, (repository.syncConversationHistory(chat.id) as RemoteResult.Success).value)
+        val messages = repository.messages(chat.id).first { it.size == 2 }
+        val activities = repository.tools(chat.id).first { it.size == 2 }
+
+        assertEquals(listOf("Inspect it", "Everything looks good."), messages.map(ChatMessage::body))
+        assertEquals(setOf("Agent update", "Thinking"), activities.map(ToolActivity::title).toSet())
+        assertTrue(activities.all { it.messageId == messages.last().id })
+    }
+
+    @Test
     fun discoveredAgentServicesAreAddedAutomaticallyWithoutDuplicates() = runBlocking {
         val tunnel = SshTunnelProfile(
             id = "ssh-computer",
@@ -174,6 +282,7 @@ class ChatRepositoryTest {
 private class FakeConversationClient : AgentConversationClient {
     val release = CompletableDeferred<Unit>()
     @Volatile var lastRequest: SendMessageRequest? = null
+    var sendEvents: List<AgentConversationEvent>? = null
     var remoteConversations: List<RemoteConversationSummary> = emptyList()
     var remoteMessages: List<RemoteChatMessage> = emptyList()
 
@@ -184,10 +293,13 @@ private class FakeConversationClient : AgentConversationClient {
     ) {
         lastRequest = request
         release.await()
-        onEvent(AgentConversationEvent.Accepted("thread-1", "turn-1", request.clientMessageId))
-        onEvent(AgentConversationEvent.AgentWorking)
-        onEvent(AgentConversationEvent.AssistantDelta("Hi from the agent", "assistant-1"))
-        onEvent(AgentConversationEvent.Completed)
+        val events = sendEvents ?: listOf(
+            AgentConversationEvent.Accepted("thread-1", "turn-1", request.clientMessageId),
+            AgentConversationEvent.AgentWorking,
+            AgentConversationEvent.AssistantDelta("Hi from the agent", "assistant-1"),
+            AgentConversationEvent.Completed,
+        )
+        events.forEach(onEvent)
     }
 
     override suspend fun stop(computer: RelayServer, conversationId: String) = RemoteResult.Success(Unit)

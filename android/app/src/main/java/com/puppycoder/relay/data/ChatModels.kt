@@ -104,6 +104,16 @@ data class RemoteChatMessage(
     val body: String,
     val createdAt: Long,
     val updatedAt: Long = createdAt,
+    val activities: List<RemoteChatActivity> = emptyList(),
+)
+
+data class RemoteChatActivity(
+    val remoteId: String,
+    val title: String,
+    val detail: String = "",
+    val failed: Boolean = false,
+    val createdAt: Long,
+    val replacesMessageRemoteId: String? = null,
 )
 
 data class RemoteChatSyncReport(
@@ -120,6 +130,7 @@ sealed interface AgentConversationEvent {
 
     data object AgentWorking : AgentConversationEvent
     data class AssistantDelta(val text: String, val remoteMessageId: String? = null) : AgentConversationEvent
+    data class ThinkingDelta(val id: String, val text: String) : AgentConversationEvent
     data class ToolStarted(val id: String, val title: String, val detail: String = "") : AgentConversationEvent
     data class ToolCompleted(
         val id: String,
