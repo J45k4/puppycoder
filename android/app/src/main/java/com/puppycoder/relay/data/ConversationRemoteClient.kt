@@ -23,6 +23,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.io.IOException
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
@@ -731,7 +732,13 @@ class ConversationRemoteClient(
         }
 
         try {
-            val input = JSONArray().put(JSONObject().put("type", "text").put("text", request.text))
+            val input = JSONArray()
+            if (request.text.isNotBlank()) {
+                input.put(JSONObject().put("type", "text").put("text", request.text))
+            }
+            request.images.forEach { image ->
+                input.put(JSONObject().put("type", "image").put("url", image.dataUrl()))
+            }
             val turnParams = JSONObject()
                 .put("threadId", threadId)
                 .put("clientUserMessageId", request.clientMessageId)
@@ -767,7 +774,8 @@ class ConversationRemoteClient(
             val create = computer.authorizedRequest(
                 "$base/session?directory=${request.workspace.conversationUrlEncode()}",
             ).post(
-                JSONObject().put("title", request.text.take(80)).toString().toRequestBody(jsonType),
+                JSONObject().put("title", request.text.ifBlank { "Image" }.take(80))
+                    .toString().toRequestBody(jsonType),
             ).build()
             http.newCall(create).execute().use { response ->
                 if (!response.isSuccessful) error("Could not create chat: HTTP ${response.code}")
@@ -815,12 +823,21 @@ class ConversationRemoteClient(
                             // before its instance stream is ready, then drop the user message.
                             delay(350)
                             val remoteMessageId = request.openCodeMessageId()
+                            val parts = JSONArray()
+                            if (request.text.isNotBlank()) {
+                                parts.put(JSONObject().put("type", "text").put("text", request.text))
+                            }
+                            request.images.forEach { image ->
+                                parts.put(
+                                    JSONObject()
+                                        .put("type", "file")
+                                        .put("mime", image.mimeType)
+                                        .put("url", image.dataUrl()),
+                                )
+                            }
                             val promptBody = JSONObject()
                                 .put("messageID", remoteMessageId)
-                                .put(
-                                    "parts",
-                                    JSONArray().put(JSONObject().put("type", "text").put("text", request.text)),
-                                )
+                                .put("parts", parts)
                             if (request.modelId != null && request.modelProviderId != null) {
                                 promptBody.put(
                                     "model",
@@ -1041,6 +1058,13 @@ private fun String.conversationHumanize(): String = replace(Regex("([a-z])([A-Z]
     .replaceFirstChar { it.uppercase() }
 
 private fun Throwable.conversationMessage(): String = message?.takeIf(String::isNotBlank) ?: "Connection failed"
+
+private fun MessageImage.dataUrl(): String {
+    val file = File(filePath)
+    require(file.isFile) { "Attached image is no longer available: $fileName" }
+    val encoded = Base64.encodeToString(file.readBytes(), Base64.NO_WRAP)
+    return "data:$mimeType;base64,$encoded"
+}
 
 /** Matches OpenCode's ascending Identifier.create("msg") layout while remaining retry-stable. */
 private fun SendMessageRequest.openCodeMessageId(): String {

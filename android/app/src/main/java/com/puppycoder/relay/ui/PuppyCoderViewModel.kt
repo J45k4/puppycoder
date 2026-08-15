@@ -185,10 +185,10 @@ class PuppyCoderViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
-    fun sendMessage(text: String) {
+    fun sendMessage(text: String, imageUris: List<String> = emptyList()) {
         val id = selectedChatId.value ?: return
         viewModelScope.launch {
-            runCatching { repository.sendMessage(id, text) }
+            runCatching { repository.sendMessage(id, text, imageUris) }
                 .onFailure { _notices.emit(it.message ?: "Could not queue message") }
         }
     }

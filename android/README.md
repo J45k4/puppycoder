@@ -9,6 +9,7 @@ PuppyCoder is a chat-first Android client for Codex app-server and OpenCode. Eac
 - Server history hydration when an imported chat is opened, with stable de-duplication
 - New chat flow with computer selection and optional workspace override
 - Multi-turn Codex threads and OpenCode sessions
+- Up to four photo attachments per message, including image-only prompts and durable retry support
 - Optimistic, durable outbox: the bubble appears immediately and messages send FIFO per chat
 - Visible queued, “Sending to …”, sent, streaming, stopped, uncertain, and failed states
 - Assistant response streaming, tool activity cards, retry, remove, and stop controls
@@ -16,7 +17,7 @@ PuppyCoder is a chat-first Android client for Codex app-server and OpenCode. Eac
 - A per-chat model picker populated from the selected Codex or OpenCode server
 - Keystore-encrypted connection passwords, SSH passwords, private keys, and passphrases
 - Direct, automatic best-route, or specific SSH tunnel routing
-- Multiple reusable single-hop SSH tunnels opened on demand, with priorities and route rules
+- Editable, reusable single-hop SSH computers opened on demand, with credentials, priorities, and route rules
 - Connection and SSH forwarding tests with route/latency feedback
 - SSH-first computers with automatic Codex/OpenCode discovery and service creation
 
@@ -136,5 +137,7 @@ Leaving the fingerprint blank accepts any host key and is vulnerable to an on-pa
 PuppyCoder keeps one initialized Codex WebSocket per configured computer and multiplexes model, history, thread, turn, and interrupt RPCs over it. Responses are routed by RPC id; streamed notifications are routed by thread and turn id. A stored `threadId` is resumed once when it attaches to a connection, later messages use `turn/start`, the local message UUID is sent as `clientUserMessageId`, and stop uses `turn/interrupt` on the same socket. OkHttp pings keep idle sockets alive; reconnects reinitialize the transport, resume active thread subscriptions, and never replay `turn/start` automatically.
 
 OpenCode chats persist the session ID, attach a stable `messageID`, send through `prompt_async`, stream `/event` message/tool/session events, and stop with the session abort endpoint.
+
+Selected images are resized to at most 2048 px, copied into private app storage, and stored with the queued message. Codex receives image URL inputs and OpenCode receives data-URL file parts, so retries do not depend on temporary photo-picker access.
 
 PuppyCoder currently starts Codex threads with `approvalPolicy: "never"`. Interactive approval cards are intentionally not enabled yet.

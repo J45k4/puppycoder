@@ -1,13 +1,17 @@
 package com.puppycoder.relay.ui
 
+import android.content.Context
 import android.content.Intent
+import android.graphics.BitmapFactory
 import android.net.Uri
 import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -72,6 +76,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -82,6 +87,8 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
 import androidx.compose.ui.input.nestedscroll.NestedScrollSource
 import androidx.compose.ui.input.nestedscroll.nestedScroll
@@ -109,6 +116,7 @@ import com.puppycoder.relay.data.Conversation
 import com.puppycoder.relay.data.ConversationState
 import com.puppycoder.relay.data.DeliveryState
 import com.puppycoder.relay.data.DiscoveredAgentServer
+import com.puppycoder.relay.data.MessageImage
 import com.puppycoder.relay.data.MessageRole
 import com.puppycoder.relay.data.RelayServer
 import com.puppycoder.relay.data.ServerKind
@@ -126,6 +134,8 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.UUID
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 private enum class MainScreen {
     CHATS,
@@ -158,6 +168,7 @@ fun RelayApp(viewModel: PuppyCoderViewModel = viewModel()) {
     var showAddComputer by rememberSaveable { mutableStateOf(false) }
     var computerDraft by remember { mutableStateOf<RelayServer?>(null) }
     var showAddTunnel by rememberSaveable { mutableStateOf(false) }
+    var tunnelDraftId by rememberSaveable { mutableStateOf<String?>(null) }
     var addRouteTunnelId by rememberSaveable { mutableStateOf<String?>(null) }
     var showChatArrangement by rememberSaveable { mutableStateOf(false) }
     var showUpdatePrompt by rememberSaveable { mutableStateOf(false) }
@@ -175,9 +186,13 @@ fun RelayApp(viewModel: PuppyCoderViewModel = viewModel()) {
         computerDraft = draft
         showAddComputer = true
     }
+    val openTunnelEditor: (SshTunnelProfile?) -> Unit = { draft ->
+        tunnelDraftId = draft?.id
+        showAddTunnel = true
+    }
     val startNewChat = {
         when (computers.size) {
-            0 -> showAddTunnel = true
+            0 -> openTunnelEditor(null)
             1 -> computers.single().let { viewModel.createChat(it.id, it.workspace, "") }
             else -> showNewChat = true
         }
@@ -263,7 +278,7 @@ fun RelayApp(viewModel: PuppyCoderViewModel = viewModel()) {
             floatingActionButton = {
                 ExtendedFloatingActionButton(
                     onClick = {
-                        if (screen == MainScreen.CHATS) startNewChat() else showAddTunnel = true
+                        if (screen == MainScreen.CHATS) startNewChat() else openTunnelEditor(null)
                     },
                     icon = { Icon(Icons.Default.Add, contentDescription = null) },
                     text = { Text(if (screen == MainScreen.CHATS) "New chat" else "Add computer") },
@@ -298,11 +313,12 @@ fun RelayApp(viewModel: PuppyCoderViewModel = viewModel()) {
                     onDelete = viewModel::deleteComputer,
                     onTestTunnel = viewModel::testTunnel,
                     onDiscoverTunnel = viewModel::discoverServers,
+                    onEditTunnel = { openTunnelEditor(it) },
                     onDeleteTunnel = viewModel::deleteTunnel,
                     onAddRoute = { addRouteTunnelId = it },
                     onDeleteRoute = viewModel::deleteTunnelRoute,
-                    onAddTunnel = { showAddTunnel = true },
-                    onAdd = { showAddTunnel = true },
+                    onAddTunnel = { openTunnelEditor(null) },
+                    onAdd = { openTunnelEditor(null) },
                 )
             }
         }
@@ -318,7 +334,7 @@ fun RelayApp(viewModel: PuppyCoderViewModel = viewModel()) {
             },
             onAddComputer = {
                 showNewChat = false
-                showAddTunnel = true
+                openTunnelEditor(null)
             },
         )
     }
@@ -340,11 +356,18 @@ fun RelayApp(viewModel: PuppyCoderViewModel = viewModel()) {
     }
 
     if (showAddTunnel) {
+        val editingTunnel = tunnelDraftId != null
+        val initial = tunnelDraftId?.let { id -> tunnels.firstOrNull { it.id == id } }
         AddTunnelSheet(
-            onDismiss = { showAddTunnel = false },
+            initial = initial,
+            onDismiss = {
+                showAddTunnel = false
+                tunnelDraftId = null
+            },
             onSave = {
                 showAddTunnel = false
-                viewModel.saveTunnelAndDiscover(it)
+                tunnelDraftId = null
+                if (editingTunnel) viewModel.saveTunnel(it) else viewModel.saveTunnelAndDiscover(it)
             },
         )
     }
@@ -765,7 +788,7 @@ private fun ConversationScreen(
     messages: List<ChatMessage>,
     tools: List<ToolActivity>,
     onBack: () -> Unit,
-    onSend: (String) -> Unit,
+    onSend: (String, List<String>) -> Unit,
     onRetry: (String) -> Unit,
     onRemove: (String) -> Unit,
     onStop: () -> Unit,
@@ -778,6 +801,12 @@ private fun ConversationScreen(
     onUpdateAction: () -> Unit,
 ) {
     var draft by rememberSaveable(conversation.id) { mutableStateOf("") }
+    var imageUris by remember(conversation.id) { mutableStateOf<List<Uri>>(emptyList()) }
+    val imagePicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickMultipleVisualMedia(4),
+    ) { selected ->
+        imageUris = (imageUris + selected).distinct().take(4)
+    }
     val listState = rememberLazyListState()
     val computerName = computer?.name ?: "Computer"
     val busy = conversation.state == ConversationState.WORKING || conversation.state == ConversationState.SENDING
@@ -852,12 +881,21 @@ private fun ConversationScreen(
         bottomBar = {
             MessageComposer(
                 value = draft,
+                imageUris = imageUris,
                 onValueChange = { draft = it },
+                onAttach = {
+                    imagePicker.launch(
+                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
+                    )
+                },
+                onRemoveImage = { uri -> imageUris = imageUris - uri },
                 onSend = {
                     val outgoing = draft.trim()
-                    if (outgoing.isNotEmpty()) {
+                    if (outgoing.isNotEmpty() || imageUris.isNotEmpty()) {
+                        val outgoingImages = imageUris.map(Uri::toString)
                         draft = ""
-                        onSend(outgoing)
+                        imageUris = emptyList()
+                        onSend(outgoing, outgoingImages)
                     }
                 },
             )
@@ -1061,10 +1099,18 @@ private fun MessageBubble(
             color = if (outgoing) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
         ) {
             if (outgoing) {
-                MarkdownMessage(
-                    text = message.body,
-                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 11.dp),
-                )
+                Column(Modifier.padding(horizontal = 10.dp, vertical = 10.dp)) {
+                    if (message.images.isNotEmpty()) {
+                        MessageImageRow(message.images)
+                        if (message.body.isNotBlank()) Spacer(Modifier.height(8.dp))
+                    }
+                    if (message.body.isNotBlank()) {
+                        MarkdownMessage(
+                            text = message.body,
+                            modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp),
+                        )
+                    }
+                }
             } else {
                 Column(Modifier.padding(horizontal = 10.dp, vertical = 10.dp)) {
                     if (activities.isNotEmpty()) {
@@ -1281,40 +1327,154 @@ private fun ThinkingActivityRow(activity: ToolActivity) {
 }
 
 @Composable
-private fun MessageComposer(value: String, onValueChange: (String) -> Unit, onSend: () -> Unit) {
-    Surface(shadowElevation = 4.dp) {
-        Row(
-            modifier = Modifier.fillMaxWidth().navigationBarsPadding().imePadding().padding(horizontal = 10.dp, vertical = 9.dp),
-            verticalAlignment = Alignment.Bottom,
-        ) {
-            OutlinedTextField(
-                value = value,
-                onValueChange = onValueChange,
-                modifier = Modifier.weight(1f),
-                placeholder = { Text("Message the agent") },
-                minLines = 1,
-                maxLines = 5,
-                shape = RoundedCornerShape(22.dp),
-                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                keyboardActions = KeyboardActions(onSend = { onSend() }),
-            )
-            Spacer(Modifier.width(7.dp))
-            IconButton(
-                onClick = onSend,
-                enabled = value.isNotBlank(),
-                modifier = Modifier.background(
-                    if (value.isNotBlank()) RelayGreen else MaterialTheme.colorScheme.surfaceVariant,
-                    CircleShape,
-                ),
+private fun MessageImageRow(images: List<MessageImage>) {
+    Row(
+        modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+        horizontalArrangement = Arrangement.spacedBy(7.dp),
+    ) {
+        images.forEach { image ->
+            val preview by produceState<ImageBitmap?>(null, image.filePath) {
+                value = withContext(Dispatchers.IO) { decodeFilePreview(image.filePath) }
+            }
+            Surface(
+                modifier = Modifier
+                    .width(if (images.size == 1) 180.dp else 116.dp)
+                    .height(if (images.size == 1) 130.dp else 96.dp),
+                shape = RoundedCornerShape(12.dp),
+                color = MaterialTheme.colorScheme.surface,
             ) {
-                Icon(
-                    Icons.AutoMirrored.Filled.Send,
-                    contentDescription = "Send",
-                    tint = if (value.isNotBlank()) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                if (preview != null) {
+                    Image(
+                        bitmap = checkNotNull(preview),
+                        contentDescription = image.fileName,
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Crop,
+                    )
+                } else {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Text("Image", style = MaterialTheme.typography.labelMedium)
+                    }
+                }
             }
         }
     }
+}
+
+@Composable
+private fun DraftImagePreview(uri: Uri, onRemove: () -> Unit) {
+    val context = LocalContext.current
+    val preview by produceState<ImageBitmap?>(null, uri) {
+        value = withContext(Dispatchers.IO) { decodeUriPreview(context, uri) }
+    }
+    Box(Modifier.size(76.dp)) {
+        Surface(
+            modifier = Modifier.fillMaxSize(),
+            shape = RoundedCornerShape(12.dp),
+            color = MaterialTheme.colorScheme.surfaceVariant,
+        ) {
+            if (preview != null) {
+                Image(
+                    bitmap = checkNotNull(preview),
+                    contentDescription = "Attached image",
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Crop,
+                )
+            }
+        }
+        IconButton(
+            onClick = onRemove,
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .padding(3.dp)
+                .size(24.dp)
+                .background(MaterialTheme.colorScheme.surface.copy(alpha = .88f), CircleShape),
+        ) {
+            Icon(Icons.Default.Close, contentDescription = "Remove image", modifier = Modifier.size(15.dp))
+        }
+    }
+}
+
+@Composable
+private fun MessageComposer(
+    value: String,
+    imageUris: List<Uri>,
+    onValueChange: (String) -> Unit,
+    onAttach: () -> Unit,
+    onRemoveImage: (Uri) -> Unit,
+    onSend: () -> Unit,
+) {
+    val canSend = value.isNotBlank() || imageUris.isNotEmpty()
+    Surface(shadowElevation = 4.dp) {
+        Column(
+            modifier = Modifier.fillMaxWidth().navigationBarsPadding().imePadding().padding(horizontal = 10.dp, vertical = 9.dp),
+        ) {
+            if (imageUris.isNotEmpty()) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(bottom = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    imageUris.forEach { uri -> DraftImagePreview(uri) { onRemoveImage(uri) } }
+                }
+            }
+            Row(verticalAlignment = Alignment.Bottom) {
+                IconButton(onClick = onAttach, enabled = imageUris.size < 4) {
+                    Icon(Icons.Default.Add, contentDescription = "Attach images")
+                }
+                OutlinedTextField(
+                    value = value,
+                    onValueChange = onValueChange,
+                    modifier = Modifier.weight(1f),
+                    placeholder = { Text("Message the agent") },
+                    minLines = 1,
+                    maxLines = 5,
+                    shape = RoundedCornerShape(22.dp),
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                    keyboardActions = KeyboardActions(onSend = { if (canSend) onSend() }),
+                )
+                Spacer(Modifier.width(7.dp))
+                IconButton(
+                    onClick = onSend,
+                    enabled = canSend,
+                    modifier = Modifier.background(
+                        if (canSend) RelayGreen else MaterialTheme.colorScheme.surfaceVariant,
+                        CircleShape,
+                    ),
+                ) {
+                    Icon(
+                        Icons.AutoMirrored.Filled.Send,
+                        contentDescription = "Send",
+                        tint = if (canSend) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+    }
+}
+
+private fun decodeUriPreview(context: Context, uri: Uri): ImageBitmap? = runCatching {
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
+    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return@runCatching null
+    val options = BitmapFactory.Options().apply { inSampleSize = previewSampleSize(bounds.outWidth, bounds.outHeight) }
+    context.contentResolver.openInputStream(uri)?.use {
+        BitmapFactory.decodeStream(it, null, options)?.asImageBitmap()
+    }
+}.getOrNull()
+
+private fun decodeFilePreview(path: String): ImageBitmap? = runCatching {
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeFile(path, bounds)
+    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return@runCatching null
+    BitmapFactory.decodeFile(
+        path,
+        BitmapFactory.Options().apply { inSampleSize = previewSampleSize(bounds.outWidth, bounds.outHeight) },
+    )?.asImageBitmap()
+}.getOrNull()
+
+private fun previewSampleSize(width: Int, height: Int): Int {
+    var sample = 1
+    while (maxOf(width, height) / sample > 512) sample *= 2
+    return sample
 }
 
 @Composable
@@ -1327,6 +1487,7 @@ private fun ComputersScreen(
     onDelete: (String) -> Unit,
     onTestTunnel: (String) -> Unit,
     onDiscoverTunnel: (String) -> Unit,
+    onEditTunnel: (SshTunnelProfile) -> Unit,
     onDeleteTunnel: (String) -> Unit,
     onAddRoute: (String) -> Unit,
     onDeleteRoute: (String, TunnelRouteRule) -> Unit,
@@ -1378,6 +1539,7 @@ private fun ComputersScreen(
                 tunnel = tunnel,
                 onTest = { onTestTunnel(tunnel.id) },
                 onDiscover = { onDiscoverTunnel(tunnel.id) },
+                onEdit = { onEditTunnel(tunnel) },
                 onDelete = { onDeleteTunnel(tunnel.id) },
                 onAddRoute = { onAddRoute(tunnel.id) },
                 onDeleteRoute = { route -> onDeleteRoute(tunnel.id, route) },
@@ -1416,6 +1578,7 @@ private fun TunnelCard(
     tunnel: SshTunnelProfile,
     onTest: () -> Unit,
     onDiscover: () -> Unit,
+    onEdit: () -> Unit,
     onDelete: () -> Unit,
     onAddRoute: () -> Unit,
     onDeleteRoute: (TunnelRouteRule) -> Unit,
@@ -1473,6 +1636,10 @@ private fun TunnelCard(
                     Text("Test tunnel")
                 }
                 Spacer(Modifier.weight(1f))
+                TextButton(
+                    onClick = onEdit,
+                    modifier = Modifier.semantics { contentDescription = "Edit SSH computer ${tunnel.name}" },
+                ) { Text("Edit") }
                 TextButton(onClick = onDelete) { Text("Delete", color = RelayRed) }
             }
         }
@@ -1680,7 +1847,7 @@ private fun AddComputerSheet(
             contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 28.dp),
         ) {
             item {
-                SheetTitle("Add computer", onDismiss)
+                SheetTitle(if (initial == null) "Add agent service" else "Edit agent service", onDismiss)
                 Text("Agent type", style = MaterialTheme.typography.labelLarge)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     ServerKind.entries.forEach { option ->
@@ -1758,7 +1925,7 @@ private fun AddComputerSheet(
                     },
                     enabled = name.isNotBlank() && endpoint.isNotBlank() && workspace.isNotBlank(),
                     modifier = Modifier.fillMaxWidth().height(50.dp),
-                ) { Text("Save computer") }
+                ) { Text(if (initial == null) "Add agent service" else "Save changes") }
             }
         }
     }
@@ -1766,17 +1933,30 @@ private fun AddComputerSheet(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun AddTunnelSheet(onDismiss: () -> Unit, onSave: (SshTunnelProfile) -> Unit) {
-    var name by rememberSaveable { mutableStateOf("") }
-    var host by rememberSaveable { mutableStateOf("") }
-    var sshPort by rememberSaveable { mutableStateOf("22") }
-    var username by rememberSaveable { mutableStateOf("") }
-    var password by rememberSaveable { mutableStateOf("") }
-    var privateKey by rememberSaveable { mutableStateOf("") }
-    var privateKeyPassphrase by rememberSaveable { mutableStateOf("") }
-    var fingerprint by rememberSaveable { mutableStateOf("") }
-    var targets by rememberSaveable { mutableStateOf("127.0.0.1:4310\n127.0.0.1:4096") }
-    var priority by rememberSaveable { mutableStateOf("100") }
+private fun AddTunnelSheet(
+    initial: SshTunnelProfile? = null,
+    onDismiss: () -> Unit,
+    onSave: (SshTunnelProfile) -> Unit,
+) {
+    var name by rememberSaveable(initial?.id) { mutableStateOf(initial?.name.orEmpty()) }
+    var host by rememberSaveable(initial?.id) { mutableStateOf(initial?.ssh?.host.orEmpty()) }
+    var sshPort by rememberSaveable(initial?.id) { mutableStateOf((initial?.ssh?.port ?: 22).toString()) }
+    var username by rememberSaveable(initial?.id) { mutableStateOf(initial?.ssh?.username.orEmpty()) }
+    var password by rememberSaveable(initial?.id) { mutableStateOf(initial?.ssh?.password.orEmpty()) }
+    var privateKey by rememberSaveable(initial?.id) { mutableStateOf(initial?.ssh?.privateKey.orEmpty()) }
+    var privateKeyPassphrase by rememberSaveable(initial?.id) {
+        mutableStateOf(initial?.ssh?.privateKeyPassphrase.orEmpty())
+    }
+    var fingerprint by rememberSaveable(initial?.id) {
+        mutableStateOf(initial?.ssh?.hostKeyFingerprint.orEmpty())
+    }
+    var targets by rememberSaveable(initial?.id) {
+        mutableStateOf(
+            initial?.routes?.joinToString("\n") { it.displayNameForEditor() }
+                ?: "127.0.0.1:4310\n127.0.0.1:4096",
+        )
+    }
+    var priority by rememberSaveable(initial?.id) { mutableStateOf((initial?.priority ?: 100).toString()) }
     val parsedRoutes = remember(targets) { targets.parseTunnelRoutes() }
     val valid = name.isNotBlank() && host.isNotBlank() && username.isNotBlank() &&
         (password.isNotBlank() || privateKey.isNotBlank()) &&
@@ -1788,9 +1968,13 @@ private fun AddTunnelSheet(onDismiss: () -> Unit, onSave: (SshTunnelProfile) -> 
             contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 30.dp),
         ) {
             item {
-                SheetTitle("Add computer", onDismiss)
+                SheetTitle(if (initial == null) "Add computer" else "Edit computer", onDismiss)
                 Text(
-                    "Connect over SSH and PuppyCoder will automatically find Codex and OpenCode services.",
+                    if (initial == null) {
+                        "Connect over SSH and PuppyCoder will automatically find Codex and OpenCode services."
+                    } else {
+                        "Update this computer's SSH connection, credentials, routes, and priority."
+                    },
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Spacer(Modifier.height(10.dp))
@@ -1847,6 +2031,7 @@ private fun AddTunnelSheet(onDismiss: () -> Unit, onSave: (SshTunnelProfile) -> 
                     onClick = {
                         onSave(
                             SshTunnelProfile(
+                                id = initial?.id ?: UUID.randomUUID().toString(),
                                 name = name.trim(),
                                 ssh = SshTunnelConfig(
                                     host = host.trim(),
@@ -1859,12 +2044,13 @@ private fun AddTunnelSheet(onDismiss: () -> Unit, onSave: (SshTunnelProfile) -> 
                                 ),
                                 routes = parsedRoutes,
                                 priority = checkNotNull(priority.toIntOrNull()),
+                                enabled = initial?.enabled ?: true,
                             ),
                         )
                     },
                     enabled = valid,
                     modifier = Modifier.fillMaxWidth().height(50.dp),
-                ) { Text("Connect and discover") }
+                ) { Text(if (initial == null) "Connect and discover" else "Save changes") }
             }
         }
     }
@@ -2024,3 +2210,5 @@ private fun String.isValidRoutePattern(): Boolean {
 }
 
 private fun TunnelRouteRule.displayName(): String = hostPattern + (port?.let { ":$it" } ?: " · any port")
+
+private fun TunnelRouteRule.displayNameForEditor(): String = hostPattern + (port?.let { ":$it" } ?: "")

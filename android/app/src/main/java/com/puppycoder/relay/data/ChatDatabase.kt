@@ -134,6 +134,30 @@ data class ChatMessageEntity(
 )
 
 @Entity(
+    tableName = "message_images",
+    foreignKeys = [
+        ForeignKey(
+            entity = ChatMessageEntity::class,
+            parentColumns = ["id"],
+            childColumns = ["messageId"],
+            onDelete = ForeignKey.CASCADE,
+        ),
+    ],
+    indices = [Index("messageId")],
+)
+data class MessageImageEntity(
+    @androidx.room.PrimaryKey val id: String,
+    val messageId: String,
+    val mimeType: String,
+    val filePath: String,
+    val fileName: String,
+    val sizeBytes: Long,
+    val width: Int,
+    val height: Int,
+    val createdAt: Long,
+)
+
+@Entity(
     tableName = "tool_activity",
     foreignKeys = [
         ForeignKey(
@@ -237,6 +261,16 @@ interface ChatDao {
     suspend fun getMessage(id: String): ChatMessageEntity?
 
     @Query(
+        "SELECT message_images.* FROM message_images " +
+            "INNER JOIN messages ON messages.id = message_images.messageId " +
+            "WHERE messages.conversationId = :conversationId ORDER BY message_images.createdAt, message_images.id",
+    )
+    fun observeMessageImages(conversationId: String): Flow<List<MessageImageEntity>>
+
+    @Query("SELECT * FROM message_images WHERE messageId = :messageId ORDER BY createdAt, id")
+    suspend fun getMessageImages(messageId: String): List<MessageImageEntity>
+
+    @Query(
         "SELECT * FROM messages WHERE conversationId = :conversationId AND role = 'USER' " +
             "AND deliveryState = 'QUEUED' ORDER BY createdAt, id LIMIT 1",
     )
@@ -247,6 +281,9 @@ interface ChatDao {
 
     @Insert(onConflict = OnConflictStrategy.ABORT)
     suspend fun insertMessage(message: ChatMessageEntity)
+
+    @Insert(onConflict = OnConflictStrategy.ABORT)
+    suspend fun insertMessageImages(images: List<MessageImageEntity>)
 
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertMessagesIfMissing(messages: List<ChatMessageEntity>)
@@ -277,8 +314,13 @@ interface ChatDao {
     suspend fun recoverStreamingMessages(now: Long)
 
     @Transaction
-    suspend fun insertOptimisticMessage(conversation: ConversationEntity, message: ChatMessageEntity) {
+    suspend fun insertOptimisticMessage(
+        conversation: ConversationEntity,
+        message: ChatMessageEntity,
+        images: List<MessageImageEntity> = emptyList(),
+    ) {
         insertMessage(message)
+        if (images.isNotEmpty()) insertMessageImages(images)
         updateConversation(conversation)
     }
 }
@@ -290,9 +332,10 @@ interface ChatDao {
         TunnelRouteEntity::class,
         ConversationEntity::class,
         ChatMessageEntity::class,
+        MessageImageEntity::class,
         ToolActivityEntity::class,
     ],
-    version = 2,
+    version = 3,
     exportSchema = true,
 )
 abstract class PuppyCoderDatabase : RoomDatabase() {
@@ -306,7 +349,7 @@ abstract class PuppyCoderDatabase : RoomDatabase() {
                 context.applicationContext,
                 PuppyCoderDatabase::class.java,
                 "puppycoder.db",
-            ).addMigrations(MIGRATION_1_2).build().also { instance = it }
+            ).addMigrations(MIGRATION_1_2, MIGRATION_2_3).build().also { instance = it }
         }
 
         val MIGRATION_1_2 = object : Migration(1, 2) {
@@ -314,6 +357,22 @@ abstract class PuppyCoderDatabase : RoomDatabase() {
                 database.execSQL("ALTER TABLE conversations ADD COLUMN modelId TEXT")
                 database.execSQL("ALTER TABLE conversations ADD COLUMN modelProviderId TEXT")
                 database.execSQL("ALTER TABLE conversations ADD COLUMN modelDisplayName TEXT")
+            }
+        }
+
+        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(database: SupportSQLiteDatabase) {
+                database.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `message_images` (" +
+                        "`id` TEXT NOT NULL, `messageId` TEXT NOT NULL, `mimeType` TEXT NOT NULL, " +
+                        "`filePath` TEXT NOT NULL, `fileName` TEXT NOT NULL, `sizeBytes` INTEGER NOT NULL, " +
+                        "`width` INTEGER NOT NULL, `height` INTEGER NOT NULL, `createdAt` INTEGER NOT NULL, " +
+                        "PRIMARY KEY(`id`), FOREIGN KEY(`messageId`) REFERENCES `messages`(`id`) " +
+                        "ON UPDATE NO ACTION ON DELETE CASCADE)",
+                )
+                database.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_message_images_messageId` ON `message_images` (`messageId`)",
+                )
             }
         }
     }
@@ -349,7 +408,7 @@ internal fun Conversation.toEntity() = ConversationEntity(
     updatedAt = updatedAt,
 )
 
-internal fun ChatMessageEntity.toModel() = ChatMessage(
+internal fun ChatMessageEntity.toModel(images: List<MessageImage> = emptyList()) = ChatMessage(
     id = id,
     conversationId = conversationId,
     role = MessageRole.valueOf(role),
@@ -358,8 +417,33 @@ internal fun ChatMessageEntity.toModel() = ChatMessage(
     remoteMessageId = remoteMessageId,
     remoteTurnId = remoteTurnId,
     errorMessage = errorMessage,
+    images = images,
     createdAt = createdAt,
     updatedAt = updatedAt,
+)
+
+internal fun MessageImageEntity.toModel() = MessageImage(
+    id = id,
+    messageId = messageId,
+    mimeType = mimeType,
+    filePath = filePath,
+    fileName = fileName,
+    sizeBytes = sizeBytes,
+    width = width,
+    height = height,
+    createdAt = createdAt,
+)
+
+internal fun MessageImage.toEntity() = MessageImageEntity(
+    id = id,
+    messageId = messageId,
+    mimeType = mimeType,
+    filePath = filePath,
+    fileName = fileName,
+    sizeBytes = sizeBytes,
+    width = width,
+    height = height,
+    createdAt = createdAt,
 )
 
 internal fun ChatMessage.toEntity() = ChatMessageEntity(

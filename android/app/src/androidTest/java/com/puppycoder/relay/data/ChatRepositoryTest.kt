@@ -1,6 +1,9 @@
 package com.puppycoder.relay.data
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Color
+import android.net.Uri
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -14,19 +17,68 @@ import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
+import java.io.File
 
 @RunWith(AndroidJUnit4::class)
 class ChatRepositoryTest {
+    private lateinit var context: Context
     private lateinit var database: PuppyCoderDatabase
     private lateinit var repository: ChatRepository
     private lateinit var client: FakeConversationClient
 
     @Before
     fun setUp() {
-        val context = ApplicationProvider.getApplicationContext<Context>()
+        context = ApplicationProvider.getApplicationContext()
         database = Room.inMemoryDatabaseBuilder(context, PuppyCoderDatabase::class.java).build()
         client = FakeConversationClient()
         repository = ChatRepository(context, database.chatDao(), client, SecretStore())
+    }
+
+    @Test
+    fun imageOnlyMessageIsCopiedPersistedAndIncludedInDelivery() = runBlocking {
+        val computer = RelayServer(
+            id = "computer-1",
+            name = "Codex computer",
+            kind = ServerKind.CODEX,
+            endpoint = "ws://127.0.0.1:4310",
+            workspace = "/workspace",
+            routeMode = ServerRouteMode.DIRECT,
+        )
+        repository.saveComputer(computer)
+        val conversationId = repository.createConversation(computer.id, computer.workspace)
+        val source = File(context.cacheDir, "attachment-source.png")
+        Bitmap.createBitmap(32, 24, Bitmap.Config.ARGB_8888).also { bitmap ->
+            bitmap.eraseColor(Color.MAGENTA)
+            source.outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            bitmap.recycle()
+        }
+
+        val messageId = repository.sendMessage(
+            conversationId,
+            text = "",
+            imageUris = listOf(Uri.fromFile(source).toString()),
+        )
+        val optimistic = repository.messages(conversationId).first { messages ->
+            messages.singleOrNull()?.images?.size == 1
+        }.single()
+
+        assertEquals(messageId, optimistic.id)
+        assertEquals("", optimistic.body)
+        assertEquals(32, optimistic.images.single().width)
+        assertEquals(24, optimistic.images.single().height)
+        assertTrue(File(optimistic.images.single().filePath).isFile)
+        assertTrue(optimistic.images.single().filePath != source.absolutePath)
+
+        client.release.complete(Unit)
+        withTimeout(5_000) {
+            repository.messages(conversationId).first { messages ->
+                messages.firstOrNull { it.id == messageId }?.deliveryState == DeliveryState.DELIVERED
+            }
+        }
+        assertEquals("", client.lastRequest?.text)
+        assertEquals(1, client.lastRequest?.images?.size)
+        source.delete()
+        Unit
     }
 
     @After
@@ -140,6 +192,39 @@ class ChatRepositoryTest {
         assertTrue(
             runCatching { repository.deleteTunnelRoute(tunnel.id, withOneRoute.routes.single()) }.isFailure,
         )
+    }
+
+    @Test
+    fun editingSshComputerPreservesItsIdentityAndRefreshesTheTunnel() = runBlocking {
+        val original = SshTunnelProfile(
+            id = "tunnel-edit",
+            name = "Workstation",
+            ssh = SshTunnelConfig(
+                host = "old.example",
+                username = "puppy",
+                password = "old-secret",
+            ),
+            routes = listOf(TunnelRouteRule("127.0.0.1", 4310)),
+            priority = 100,
+        )
+        repository.saveTunnel(original)
+
+        repository.saveTunnel(
+            original.copy(
+                name = "Office workstation",
+                ssh = original.ssh.copy(host = "new.example", password = "new-secret"),
+                routes = listOf(TunnelRouteRule("agent.internal", 4096)),
+                priority = 250,
+            ),
+        )
+
+        val edited = repository.tunnels.first { it.singleOrNull()?.name == "Office workstation" }.single()
+        assertEquals(original.id, edited.id)
+        assertEquals("new.example", edited.ssh.host)
+        assertEquals("new-secret", edited.ssh.password)
+        assertEquals(listOf(TunnelRouteRule("agent.internal", 4096)), edited.routes)
+        assertEquals(250, edited.priority)
+        assertEquals(listOf(original.id), client.closedTunnelProfiles)
     }
 
     @Test
@@ -285,6 +370,7 @@ private class FakeConversationClient : AgentConversationClient {
     var sendEvents: List<AgentConversationEvent>? = null
     var remoteConversations: List<RemoteConversationSummary> = emptyList()
     var remoteMessages: List<RemoteChatMessage> = emptyList()
+    val closedTunnelProfiles = mutableListOf<String>()
 
     override suspend fun send(
         computer: RelayServer,
@@ -315,6 +401,8 @@ private class FakeConversationClient : AgentConversationClient {
     override suspend fun discoverServers(profile: SshTunnelProfile) =
         RemoteResult.Success(emptyList<DiscoveredAgentServer>())
     override fun setTunnelProfiles(profiles: List<SshTunnelProfile>) = Unit
-    override fun closeTunnelProfile(profileId: String) = Unit
+    override fun closeTunnelProfile(profileId: String) {
+        closedTunnelProfiles += profileId
+    }
     override fun close() = Unit
 }

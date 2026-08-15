@@ -67,8 +67,21 @@ data class ChatMessage(
     val remoteMessageId: String? = null,
     val remoteTurnId: String? = null,
     val errorMessage: String? = null,
+    val images: List<MessageImage> = emptyList(),
     val createdAt: Long = System.currentTimeMillis(),
     val updatedAt: Long = createdAt,
+)
+
+data class MessageImage(
+    val id: String = UUID.randomUUID().toString(),
+    val messageId: String,
+    val mimeType: String,
+    val filePath: String,
+    val fileName: String,
+    val sizeBytes: Long,
+    val width: Int,
+    val height: Int,
+    val createdAt: Long = System.currentTimeMillis(),
 )
 
 data class ToolActivity(
@@ -149,6 +162,7 @@ data class SendMessageRequest(
     val clientMessageId: String,
     val workspace: String,
     val text: String,
+    val images: List<MessageImage> = emptyList(),
     val modelId: String? = null,
     val modelProviderId: String? = null,
     val createdAt: Long = System.currentTimeMillis(),

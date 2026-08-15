@@ -33,6 +33,7 @@ class ChatRepository(
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val conversationLocks = ConcurrentHashMap<String, Mutex>()
     private val remoteSyncMutex = Mutex()
+    private val imageStore = MessageImageStore(context)
 
     val computers: Flow<List<RelayServer>> = dao.observeComputers().map { entities ->
         entities.map { it.toModel(secretStore) }
@@ -219,8 +220,13 @@ class ChatRepository(
 
     fun conversation(id: String): Flow<Conversation?> = dao.observeConversation(id).map { it?.toModel() }
 
-    fun messages(conversationId: String): Flow<List<ChatMessage>> =
-        dao.observeMessages(conversationId).map { list -> list.map(ChatMessageEntity::toModel) }
+    fun messages(conversationId: String): Flow<List<ChatMessage>> = combine(
+        dao.observeMessages(conversationId),
+        dao.observeMessageImages(conversationId),
+    ) { messages, images ->
+        val imagesByMessage = images.map(MessageImageEntity::toModel).groupBy(MessageImage::messageId)
+        messages.map { it.toModel(imagesByMessage[it.id].orEmpty()) }
+    }
 
     fun tools(conversationId: String): Flow<List<ToolActivity>> =
         dao.observeTools(conversationId).map { list -> list.map(ToolActivityEntity::toModel) }
@@ -232,8 +238,11 @@ class ChatRepository(
     suspend fun deleteComputer(id: String): Result<Unit> = runCatching { dao.deleteComputer(id) }
 
     suspend fun saveTunnel(profile: SshTunnelProfile) {
+        val replacingExisting = dao.getTunnels().any { it.profile.id == profile.id }
         val (entity, routes) = profile.toEntities(secretStore)
         dao.upsertTunnel(entity, routes)
+        if (replacingExisting) client.closeTunnelProfile(profile.id)
+        client.setTunnelProfiles(dao.getTunnels().map { it.toModel(secretStore) })
     }
 
     suspend fun addTunnelRoute(id: String, route: TunnelRouteRule) {
@@ -374,9 +383,13 @@ class ChatRepository(
         return conversation.id
     }
 
-    suspend fun sendMessage(conversationId: String, text: String): String {
+    suspend fun sendMessage(
+        conversationId: String,
+        text: String,
+        imageUris: List<String> = emptyList(),
+    ): String {
         val trimmed = text.trim()
-        require(trimmed.isNotEmpty()) { "Message cannot be empty" }
+        require(trimmed.isNotEmpty() || imageUris.isNotEmpty()) { "Message cannot be empty" }
         val conversation = dao.getConversation(conversationId) ?: error("Chat not found")
         val now = System.currentTimeMillis()
         val message = ChatMessage(
@@ -387,15 +400,24 @@ class ChatRepository(
             createdAt = now,
             updatedAt = now,
         )
-        dao.insertOptimisticMessage(
-            conversation.copy(
-                title = if (conversation.title == "New chat") trimmed.take(60) else conversation.title,
-                lastMessagePreview = trimmed.take(120),
-                state = ConversationState.SENDING.name,
-                updatedAt = now,
-            ),
-            message.toEntity(),
-        )
+        val images = imageStore.import(message.id, imageUris)
+        val fallback = if (images.size == 1) "Image" else "${images.size} images"
+        val preview = trimmed.ifBlank { "📷 $fallback" }
+        try {
+            dao.insertOptimisticMessage(
+                conversation.copy(
+                    title = if (conversation.title == "New chat") preview.take(60) else conversation.title,
+                    lastMessagePreview = preview.take(120),
+                    state = ConversationState.SENDING.name,
+                    updatedAt = now,
+                ),
+                message.toEntity(),
+                images.map(MessageImage::toEntity),
+            )
+        } catch (error: Throwable) {
+            images.forEach(imageStore::delete)
+            throw error
+        }
         scheduleOutbox(conversationId)
         scope.launch { drainOutbox(conversationId) }
         return message.id
@@ -423,7 +445,9 @@ class ChatRepository(
         if (message.deliveryState == DeliveryState.QUEUED.name ||
             message.deliveryState == DeliveryState.FAILED.name
         ) {
+            val images = dao.getMessageImages(messageId).map(MessageImageEntity::toModel)
             dao.deleteMessage(messageId)
+            images.forEach(imageStore::delete)
         }
     }
 
@@ -477,6 +501,7 @@ class ChatRepository(
                 clientMessageId = outgoing.id,
                 workspace = conversation.workspace,
                 text = outgoing.body,
+                images = dao.getMessageImages(outgoing.id).map(MessageImageEntity::toModel),
                 modelId = conversation.modelId,
                 modelProviderId = conversation.modelProviderId,
                 createdAt = outgoing.createdAt,
