@@ -20,6 +20,8 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
+import java.io.Closeable
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
@@ -32,6 +34,7 @@ class ChatRepository(
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val conversationLocks = ConcurrentHashMap<String, Mutex>()
+    private val historySyncCache = ConcurrentHashMap<String, CachedHistorySync>()
     private val remoteSyncMutex = Mutex()
     private val imageStore = MessageImageStore(context)
 
@@ -86,18 +89,26 @@ class ChatRepository(
         RemoteChatSyncReport(seen, failures)
     }
 
-    suspend fun syncConversationHistory(conversationId: String): RemoteResult<Int> {
+    suspend fun syncConversationHistory(
+        conversationId: String,
+        cursor: String? = null,
+    ): RemoteResult<HistorySyncPage> {
         val conversation = dao.getConversation(conversationId)
             ?: return RemoteResult.Error("Chat not found")
         val remoteId = conversation.remoteConversationId
-            ?: return RemoteResult.Success(0)
+            ?: return RemoteResult.Success(HistorySyncPage(0, null))
         val computer = dao.getComputer(conversation.computerId)?.toModel(secretStore)
             ?: return RemoteResult.Error("Computer not found")
-        return when (val result = client.loadConversation(computer, remoteId)) {
+        return when (val result = client.loadConversation(computer, remoteId, cursor)) {
             is RemoteResult.Error -> result
-            is RemoteResult.Success -> {
+            is RemoteResult.Success -> withContext(Dispatchers.Default) {
+                val cacheKey = "$conversationId:${cursor.orEmpty()}"
+                val fingerprint = result.value.historyFingerprint()
+                historySyncCache[cacheKey]?.takeIf { it.fingerprint == fingerprint }?.let { cached ->
+                    return@withContext RemoteResult.Success(cached.page.copy(importedCount = 0))
+                }
                 val existingMessages = dao.getMessages(conversationId)
-                val replacedRemoteIds = result.value
+                val replacedRemoteIds = result.value.messages
                     .flatMap(RemoteChatMessage::activities)
                     .mapNotNull(RemoteChatActivity::replacesMessageRemoteId)
                     .toSet()
@@ -109,9 +120,10 @@ class ChatRepository(
                 val existingByRemoteId = retainedMessages.mapNotNull { message ->
                     message.remoteMessageId?.let { it to message }
                 }.toMap().toMutableMap()
+                val existingToolsById = dao.getTools(conversationId).associateByTo(mutableMapOf()) { it.id }
                 var importedCount = 0
 
-                result.value.forEach { remote ->
+                result.value.messages.forEach { remote ->
                     val existing = existingByRemoteId[remote.remoteId]
                     val local = if (existing == null) {
                         ChatMessage(
@@ -137,41 +149,51 @@ class ChatRepository(
                             deliveryState = DeliveryState.DELIVERED.name,
                             updatedAt = maxOf(existing.updatedAt, remote.updatedAt),
                         )
-                        dao.updateMessage(updated)
+                        if (updated != existing) dao.updateMessage(updated)
                         updated
                     }
 
                     remote.activities.forEach { activity ->
-                        dao.upsertTool(
-                            ToolActivityEntity(
-                                id = UUID.nameUUIDFromBytes(
-                                    "remote-activity:$conversationId:${activity.remoteId}".toByteArray(),
-                                ).toString(),
-                                conversationId = conversationId,
-                                messageId = local.id,
-                                title = activity.title,
-                                detail = activity.detail,
-                                state = if (activity.failed) {
-                                    ToolActivityState.FAILED.name
-                                } else {
-                                    ToolActivityState.COMPLETED.name
-                                },
-                                createdAt = activity.createdAt,
-                                updatedAt = remote.updatedAt,
-                            ),
+                        val tool = ToolActivityEntity(
+                            id = UUID.nameUUIDFromBytes(
+                                "remote-activity:$conversationId:${activity.remoteId}".toByteArray(),
+                            ).toString(),
+                            conversationId = conversationId,
+                            messageId = local.id,
+                            title = activity.title,
+                            detail = activity.detail,
+                            state = if (activity.failed) {
+                                ToolActivityState.FAILED.name
+                            } else {
+                                ToolActivityState.COMPLETED.name
+                            },
+                            createdAt = activity.createdAt,
+                            updatedAt = remote.updatedAt,
                         )
+                        if (existingToolsById[tool.id] != tool) {
+                            dao.upsertTool(tool)
+                            existingToolsById[tool.id] = tool
+                        }
                     }
                 }
-                result.value.lastOrNull { it.body.isNotBlank() }?.let { latest ->
-                    val current = dao.getConversation(conversationId) ?: conversation
-                    dao.updateConversation(
-                        current.copy(
+                result.value.messages.takeIf { cursor == null }
+                    ?.filter { it.body.isNotBlank() }
+                    ?.maxByOrNull(RemoteChatMessage::updatedAt)
+                    ?.let { latest ->
+                        val current = dao.getConversation(conversationId) ?: conversation
+                        val updated = current.copy(
                             lastMessagePreview = latest.body.takeLast(120),
                             updatedAt = maxOf(current.updatedAt, latest.updatedAt),
-                        ),
-                    )
-                }
-                RemoteResult.Success(importedCount)
+                        )
+                        if (updated != current) dao.updateConversation(updated)
+                    }
+                val page = HistorySyncPage(
+                    importedCount = importedCount,
+                    oldestMessageAt = result.value.messages.minOfOrNull(RemoteChatMessage::createdAt),
+                    nextCursor = result.value.nextCursor,
+                )
+                historySyncCache[cacheKey] = CachedHistorySync(fingerprint, page)
+                RemoteResult.Success(page)
             }
         }
     }
@@ -230,6 +252,20 @@ class ChatRepository(
 
     fun tools(conversationId: String): Flow<List<ToolActivity>> =
         dao.observeTools(conversationId).map { list -> list.map(ToolActivityEntity::toModel) }
+
+    suspend fun oldestStoredMessageAt(conversationId: String): Long? = dao.oldestMessageAt(conversationId)
+
+    suspend fun subscribeConversation(
+        conversationId: String,
+        onChanged: () -> Unit,
+    ): RemoteResult<Closeable?> {
+        val conversation = dao.getConversation(conversationId)
+            ?: return RemoteResult.Error("Chat not found")
+        val remoteId = conversation.remoteConversationId ?: return RemoteResult.Success(null)
+        val computer = dao.getComputer(conversation.computerId)?.toModel(secretStore)
+            ?: return RemoteResult.Error("Computer not found")
+        return client.subscribeConversation(computer, remoteId, onChanged)
+    }
 
     suspend fun saveComputer(computer: RelayServer) {
         dao.upsertComputer(computer.toEntity(secretStore))
@@ -692,3 +728,11 @@ class ChatRepository(
         client.close()
     }
 }
+
+private data class CachedHistorySync(
+    val fingerprint: Int,
+    val page: HistorySyncPage,
+)
+
+private fun RemoteChatPage.historyFingerprint(): Int =
+    31 * messages.hashCode() + (nextCursor?.hashCode() ?: 0)

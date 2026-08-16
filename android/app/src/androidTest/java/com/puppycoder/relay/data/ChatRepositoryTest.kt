@@ -261,8 +261,8 @@ class ChatRepositoryTest {
         assertEquals("Existing server chat", importedChat.title)
         assertEquals("/remote/workspace", importedChat.workspace)
 
-        assertEquals(2, (repository.syncConversationHistory(importedChat.id) as RemoteResult.Success).value)
-        assertEquals(0, (repository.syncConversationHistory(importedChat.id) as RemoteResult.Success).value)
+        assertEquals(2, (repository.syncConversationHistory(importedChat.id) as RemoteResult.Success).value.importedCount)
+        assertEquals(0, (repository.syncConversationHistory(importedChat.id) as RemoteResult.Success).value.importedCount)
         val messages = repository.messages(importedChat.id).first { it.size == 2 }
         assertEquals(listOf("Hello", "Hi there"), messages.map(ChatMessage::body))
         assertTrue(messages.all { it.deliveryState == DeliveryState.DELIVERED })
@@ -298,7 +298,7 @@ class ChatRepositoryTest {
         )
         repository.syncRemoteChats()
         val chat = repository.chats.first { it.size == 1 }.single().conversation
-        assertEquals(3, (repository.syncConversationHistory(chat.id) as RemoteResult.Success).value)
+        assertEquals(3, (repository.syncConversationHistory(chat.id) as RemoteResult.Success).value.importedCount)
 
         client.remoteMessages = listOf(
             RemoteChatMessage("user-remote", MessageRole.USER, "Inspect it", 1_100),
@@ -325,7 +325,7 @@ class ChatRepositoryTest {
             ),
         )
 
-        assertEquals(0, (repository.syncConversationHistory(chat.id) as RemoteResult.Success).value)
+        assertEquals(0, (repository.syncConversationHistory(chat.id) as RemoteResult.Success).value.importedCount)
         val messages = repository.messages(chat.id).first { it.size == 2 }
         val activities = repository.tools(chat.id).first { it.size == 2 }
 
@@ -394,8 +394,17 @@ private class FakeConversationClient : AgentConversationClient {
         listOf(AgentModel("gpt-test", "GPT Test")),
     )
     override suspend fun listConversations(computer: RelayServer) = RemoteResult.Success(remoteConversations)
-    override suspend fun loadConversation(computer: RelayServer, remoteConversationId: String) =
-        RemoteResult.Success(remoteMessages)
+    override suspend fun loadConversation(
+        computer: RelayServer,
+        remoteConversationId: String,
+        cursor: String?,
+        limit: Int,
+    ) = RemoteResult.Success(RemoteChatPage(remoteMessages))
+    override suspend fun subscribeConversation(
+        computer: RelayServer,
+        remoteConversationId: String,
+        onChanged: () -> Unit,
+    ) = RemoteResult.Success(null)
     override suspend fun testTunnel(profile: SshTunnelProfile, computerEndpoints: List<String>) =
         RemoteResult.Success(SshTunnelTest("ok", 1))
     override suspend fun discoverServers(profile: SshTunnelProfile) =

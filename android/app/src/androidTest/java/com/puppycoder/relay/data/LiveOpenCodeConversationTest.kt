@@ -84,7 +84,7 @@ class LiveOpenCodeConversationTest {
                 client.loadConversation(computer, firstAccepted.remoteConversationId)
             }
             assertTrue("OpenCode history failed: $history", history is RemoteResult.Success)
-            val historyText = (history as RemoteResult.Success).value.joinToString("\n") { it.body }
+            val historyText = (history as RemoteResult.Success).value.messages.joinToString("\n") { it.body }
             assertTrue(historyText.contains("PUPPY_OPEN_ONE"))
             assertTrue(historyText.contains("PUPPY_OPEN_TWO"))
         } finally {

@@ -13,7 +13,6 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -31,6 +30,7 @@ import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -72,8 +72,10 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
@@ -154,7 +156,7 @@ fun RelayApp(viewModel: PuppyCoderViewModel = viewModel()) {
     val modelPicker by viewModel.modelPicker.collectAsState()
     val chatSync by viewModel.chatSync.collectAsState()
     val chatSearchQuery by viewModel.chatSearchQuery.collectAsState()
-    val historyLoadingChatId by viewModel.historyLoadingChatId.collectAsState()
+    val historyPaging by viewModel.historyPaging.collectAsState()
     val serverDiscovery by viewModel.serverDiscovery.collectAsState()
     val chatSortOrder by viewModel.chatSortOrder.collectAsState()
     val chatGroupMode by viewModel.chatGroupMode.collectAsState()
@@ -237,7 +239,10 @@ fun RelayApp(viewModel: PuppyCoderViewModel = viewModel()) {
             modelPicker = modelPicker,
             onLoadModels = viewModel::loadModels,
             onSelectModel = viewModel::selectModel,
-            historyLoading = historyLoadingChatId == conversation?.id,
+            historyPaging = historyPaging,
+            onLoadOlder = viewModel::loadOlderMessages,
+            onScrollStateChanged = viewModel::setChatScrollInProgress,
+            onViewportAtLatestChanged = viewModel::setChatViewportAtLatest,
             snackbar = snackbar,
             appUpdate = appUpdate,
             onUpdateAction = {
@@ -795,7 +800,10 @@ private fun ConversationScreen(
     modelPicker: ModelPickerState,
     onLoadModels: (String, Boolean) -> Unit,
     onSelectModel: (AgentModel?) -> Unit,
-    historyLoading: Boolean,
+    historyPaging: HistoryPagingState,
+    onLoadOlder: () -> Unit,
+    onScrollStateChanged: (Boolean) -> Unit,
+    onViewportAtLatestChanged: (Boolean) -> Unit,
     snackbar: SnackbarHostState,
     appUpdate: AppUpdateState,
     onUpdateAction: () -> Unit,
@@ -812,15 +820,82 @@ private fun ConversationScreen(
     val busy = conversation.state == ConversationState.WORKING || conversation.state == ConversationState.SENDING
     var showModelPicker by rememberSaveable(conversation.id) { mutableStateOf(false) }
     val arrangedMessages = remember(messages, tools) { arrangeMessageActivities(messages, tools) }
+    var initialPositioned by remember(conversation.id) { mutableStateOf(false) }
+    var observedOlderPageVersion by remember(conversation.id) {
+        mutableStateOf(historyPaging.olderPageVersion)
+    }
+    val historyHeaderCount = if (historyPaging.hasOlder || historyPaging.loadingOlder) 1 else 0
+    val emptyStateCount = if (arrangedMessages.groups.isEmpty() && arrangedMessages.unboundActivities.isEmpty()) 1 else 0
+    val typingIndicatorCount = if (
+        conversation.state == ConversationState.WORKING &&
+        messages.lastOrNull()?.deliveryState != DeliveryState.STREAMING
+    ) 1 else 0
+    val listItemCount = historyHeaderCount + arrangedMessages.groups.size +
+        (if (arrangedMessages.unboundActivities.isEmpty()) 0 else 1) + emptyStateCount + typingIndicatorCount
+    val atHistoryStart by remember(listState) {
+        derivedStateOf {
+            listState.firstVisibleItemIndex == 0 && listState.firstVisibleItemScrollOffset < 160
+        }
+    }
+    val atHistoryEnd by remember(listState) {
+        derivedStateOf {
+            val layout = listState.layoutInfo
+            layout.totalItemsCount == 0 ||
+                (layout.visibleItemsInfo.lastOrNull()?.index ?: 0) >= layout.totalItemsCount - 2
+        }
+    }
+
+    LaunchedEffect(listState.isScrollInProgress) {
+        onScrollStateChanged(listState.isScrollInProgress)
+        if (!listState.isScrollInProgress) onViewportAtLatestChanged(atHistoryEnd)
+    }
+    DisposableEffect(conversation.id) {
+        onDispose {
+            onScrollStateChanged(false)
+            onViewportAtLatestChanged(true)
+        }
+    }
 
     LaunchedEffect(
-        messages.size,
+        historyPaging.initialLoading,
+        listItemCount,
+    ) {
+        if (!historyPaging.initialLoading && !initialPositioned) {
+            if (listItemCount > 0) listState.scrollToItem(listItemCount - 1)
+            initialPositioned = true
+        }
+    }
+    LaunchedEffect(
+        messages.lastOrNull()?.id,
         messages.lastOrNull()?.body,
         tools.size,
         tools.lastOrNull()?.updatedAt,
+        historyPaging.loadingOlder,
+        historyPaging.olderPageVersion,
     ) {
-        val itemCount = arrangedMessages.groups.size + if (arrangedMessages.unboundActivities.isEmpty()) 0 else 1
-        if (itemCount > 0) listState.animateScrollToItem(itemCount - 1)
+        if (!initialPositioned || historyPaging.loadingOlder) return@LaunchedEffect
+        if (observedOlderPageVersion != historyPaging.olderPageVersion) {
+            observedOlderPageVersion = historyPaging.olderPageVersion
+            return@LaunchedEffect
+        }
+        val layout = listState.layoutInfo
+        val wasNearBottom = layout.totalItemsCount == 0 ||
+            (layout.visibleItemsInfo.lastOrNull()?.index ?: 0) >= layout.totalItemsCount - 2
+        if (listItemCount > 0 && wasNearBottom) listState.animateScrollToItem(listItemCount - 1)
+    }
+    LaunchedEffect(
+        atHistoryStart,
+        initialPositioned,
+        historyPaging.hasOlder,
+        historyPaging.loadingOlder,
+        historyPaging.initialLoading,
+    ) {
+        if (
+            atHistoryStart && initialPositioned && historyPaging.hasOlder && historyPaging.olderLoadError == null &&
+            !historyPaging.loadingOlder && !historyPaging.initialLoading
+        ) {
+            onLoadOlder()
+        }
     }
     LaunchedEffect(computer?.id) {
         computer?.id?.let { onLoadModels(it, false) }
@@ -907,6 +982,26 @@ private fun ConversationScreen(
             verticalArrangement = Arrangement.spacedBy(8.dp),
             contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 16.dp),
         ) {
+            if (historyPaging.hasOlder || historyPaging.loadingOlder) {
+                item(key = "older-history") {
+                    Box(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        if (historyPaging.loadingOlder) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                                Spacer(Modifier.width(8.dp))
+                                Text("Loading older messages…", style = MaterialTheme.typography.bodySmall)
+                            }
+                        } else {
+                            TextButton(onClick = onLoadOlder) {
+                                Text(if (historyPaging.olderLoadError == null) "Load older messages" else "Retry older messages")
+                            }
+                        }
+                    }
+                }
+            }
             if (arrangedMessages.groups.isEmpty() && arrangedMessages.unboundActivities.isEmpty()) {
                 item {
                     Surface(
@@ -915,17 +1010,17 @@ private fun ConversationScreen(
                         shape = RoundedCornerShape(18.dp),
                     ) {
                         Column(Modifier.padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                            if (historyLoading) {
+                            if (historyPaging.initialLoading) {
                                 CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp)
                                 Spacer(Modifier.height(8.dp))
                             }
                             Text(
-                                if (historyLoading) "Loading messages from $computerName…" else "New chat on $computerName",
+                                if (historyPaging.initialLoading) "Loading messages from $computerName…" else "New chat on $computerName",
                                 fontWeight = FontWeight.SemiBold,
                             )
                             Spacer(Modifier.height(6.dp))
                             Text(
-                                if (historyLoading) "You can start typing while the history loads."
+                                if (historyPaging.initialLoading) "You can start typing while the history loads."
                                 else "Messages are saved here and sent in order, even after the app restarts.",
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
@@ -1212,7 +1307,6 @@ private fun ThinkingBlock(
 ) {
     val active = activities.any { it.state == ToolActivityState.RUNNING }
     val failed = activities.any { it.state == ToolActivityState.FAILED }
-    val traceScrollState = rememberScrollState()
     val containedScrollConnection = remember(groupKey) {
         object : NestedScrollConnection {
             private var childConsumedInGesture = false
@@ -1281,14 +1375,14 @@ private fun ThinkingBlock(
             }
             if (expanded) {
                 HorizontalDivider()
-                Column(
+                LazyColumn(
                     Modifier
                         .heightIn(max = 360.dp)
                         .nestedScroll(containedScrollConnection)
-                        .verticalScroll(traceScrollState)
-                        .padding(horizontal = 11.dp, vertical = 4.dp),
+                        .padding(horizontal = 11.dp),
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 4.dp),
                 ) {
-                    activities.forEachIndexed { index, activity ->
+                    itemsIndexed(activities, key = { _, activity -> activity.id }) { index, activity ->
                         ThinkingActivityRow(activity)
                         if (index != activities.lastIndex) HorizontalDivider(Modifier.padding(start = 26.dp))
                     }

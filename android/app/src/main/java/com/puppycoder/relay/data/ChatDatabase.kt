@@ -257,6 +257,9 @@ interface ChatDao {
     @Query("SELECT * FROM messages WHERE conversationId = :conversationId ORDER BY createdAt, id")
     suspend fun getMessages(conversationId: String): List<ChatMessageEntity>
 
+    @Query("SELECT MIN(createdAt) FROM messages WHERE conversationId = :conversationId")
+    suspend fun oldestMessageAt(conversationId: String): Long?
+
     @Query("SELECT * FROM messages WHERE id = :id")
     suspend fun getMessage(id: String): ChatMessageEntity?
 
@@ -296,6 +299,9 @@ interface ChatDao {
 
     @Query("SELECT * FROM tool_activity WHERE conversationId = :conversationId ORDER BY createdAt, id")
     fun observeTools(conversationId: String): Flow<List<ToolActivityEntity>>
+
+    @Query("SELECT * FROM tool_activity WHERE conversationId = :conversationId ORDER BY createdAt, id")
+    suspend fun getTools(conversationId: String): List<ToolActivityEntity>
 
     @Query("SELECT * FROM tool_activity WHERE id = :id")
     suspend fun getTool(id: String): ToolActivityEntity?

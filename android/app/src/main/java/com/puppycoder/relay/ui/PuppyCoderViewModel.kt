@@ -9,6 +9,7 @@ import com.puppycoder.relay.data.ChatMessage
 import com.puppycoder.relay.data.AgentModel
 import com.puppycoder.relay.data.ConnectionState
 import com.puppycoder.relay.data.Conversation
+import com.puppycoder.relay.data.ConversationState
 import com.puppycoder.relay.data.DiscoveredAgentServer
 import com.puppycoder.relay.data.RelayServer
 import com.puppycoder.relay.data.RemoteResult
@@ -16,15 +17,22 @@ import com.puppycoder.relay.data.SshTunnelProfile
 import com.puppycoder.relay.data.ToolActivity
 import com.puppycoder.relay.data.TunnelRouteRule
 import com.puppycoder.relay.update.AppUpdateState
+import java.io.Closeable
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
 class PuppyCoderViewModel(application: Application) : AndroidViewModel(application) {
@@ -36,7 +44,7 @@ class PuppyCoderViewModel(application: Application) : AndroidViewModel(applicati
     private val _notices = MutableSharedFlow<String>(extraBufferCapacity = 4)
     private val _modelPicker = MutableStateFlow(ModelPickerState())
     private val _chatSync = MutableStateFlow(ChatSyncState())
-    private val _historyLoadingChatId = MutableStateFlow<String?>(null)
+    private val _historyPaging = MutableStateFlow(HistoryPagingState())
     private val _chatSearchQuery = MutableStateFlow("")
     private val _serverDiscovery = MutableStateFlow(ServerDiscoveryState())
     private val _chatSortOrder = MutableStateFlow(
@@ -52,12 +60,22 @@ class PuppyCoderViewModel(application: Application) : AndroidViewModel(applicati
     private val _collapsedChatGroups = MutableStateFlow(
         chatListPreferences.getStringSet("collapsed_groups", emptySet())?.toSet().orEmpty(),
     )
+    private val historySyncMutex = Mutex()
+    private var openConversationSubscription: Closeable? = null
+    private var openConversationSubscriptionPendingFor: String? = null
+    private var openConversationSubscriptionPendingGeneration = -1L
+    private var conversationTrackingGeneration = 0L
+    private var trackedConversationId: String? = null
+    private var liveHistoryRefreshJob: Job? = null
+    private var liveHistoryRefreshPending = false
+    private var chatScrollInProgress = false
+    private var chatViewportAtLatest = true
 
     val notices = _notices.asSharedFlow()
     val appUpdate: StateFlow<AppUpdateState> = updateManager.state
     val modelPicker: StateFlow<ModelPickerState> = _modelPicker
     val chatSync: StateFlow<ChatSyncState> = _chatSync
-    val historyLoadingChatId: StateFlow<String?> = _historyLoadingChatId
+    val historyPaging: StateFlow<HistoryPagingState> = _historyPaging
     val chatSearchQuery: StateFlow<String> = _chatSearchQuery
     val serverDiscovery: StateFlow<ServerDiscoveryState> = _serverDiscovery
     val chatSortOrder: StateFlow<ChatSortOrder> = _chatSortOrder
@@ -81,27 +99,250 @@ class PuppyCoderViewModel(application: Application) : AndroidViewModel(applicati
     val selectedConversation: StateFlow<Conversation?> = selectedChatId.flatMapLatest { id ->
         if (id == null) flowOf(null) else repository.conversation(id)
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
-    val messages: StateFlow<List<ChatMessage>> = selectedChatId.flatMapLatest { id ->
+
+    init {
+        viewModelScope.launch {
+            selectedConversation.collect { conversation ->
+                conversation?.let {
+                    if (
+                        it.id == trackedConversationId &&
+                        it.remoteConversationId != null &&
+                        openConversationSubscription == null
+                    ) {
+                        ensureOpenConversationSubscription(it.id)
+                    }
+                }
+            }
+        }
+    }
+
+    private val allMessages = selectedChatId.flatMapLatest { id ->
         if (id == null) flowOf(emptyList()) else repository.messages(id)
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
-    val tools: StateFlow<List<ToolActivity>> = selectedChatId.flatMapLatest { id ->
+    }
+    val messages: StateFlow<List<ChatMessage>> = combine(
+        allMessages,
+        _historyPaging,
+        ::visibleMessagesForHistory,
+    ).stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+    private val allTools = selectedChatId.flatMapLatest { id ->
         if (id == null) flowOf(emptyList()) else repository.tools(id)
+    }
+    val tools: StateFlow<List<ToolActivity>> = combine(allTools, messages, _historyPaging) { tools, messages, paging ->
+        if (paging.initialLoading) return@combine tools
+        val visibleMessageIds = messages.mapTo(hashSetOf(), ChatMessage::id)
+        tools.filter { activity ->
+            activity.messageId?.let(visibleMessageIds::contains)
+                ?: (
+                    paging.allHistoryLoaded || activity.createdAt >= paging.openedAt ||
+                        paging.oldestLoadedAt?.let { activity.createdAt >= it } == true
+                    )
+        }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     fun openChat(id: String) {
+        stopTrackingOpenConversation()
+        trackedConversationId = id
+        _historyPaging.value = HistoryPagingState(
+            conversationId = id,
+            initialLoading = true,
+            openedAt = System.currentTimeMillis(),
+        )
         selectedChatId.value = id
-        _historyLoadingChatId.value = id
         viewModelScope.launch {
-            when (val result = repository.syncConversationHistory(id)) {
-                is RemoteResult.Success -> Unit
-                is RemoteResult.Error -> _notices.emit("Could not load server history: ${result.message}")
+            val cachedOldestAt = repository.oldestStoredMessageAt(id)
+            ensureOpenConversationSubscription(id)
+            when (val result = historySyncMutex.withLock { repository.syncConversationHistory(id) }) {
+                is RemoteResult.Success -> {
+                    if (_historyPaging.value.conversationId == id) {
+                        _historyPaging.value = _historyPaging.value.withPage(
+                            result.value,
+                            initial = true,
+                            cachedOldestAt = cachedOldestAt,
+                        )
+                    }
+                }
+                is RemoteResult.Error -> {
+                    if (_historyPaging.value.conversationId == id) {
+                        _historyPaging.value = _historyPaging.value.copy(
+                            initialLoading = false,
+                            allHistoryLoaded = true,
+                        )
+                    }
+                    _notices.emit("Could not load server history: ${result.message}")
+                }
             }
-            if (_historyLoadingChatId.value == id) _historyLoadingChatId.value = null
+        }
+    }
+
+    fun loadOlderMessages() {
+        val current = _historyPaging.value
+        val id = selectedChatId.value ?: return
+        val cursor = current.nextCursor ?: return
+        if (current.conversationId != id || current.initialLoading || current.loadingOlder) return
+        _historyPaging.value = current.copy(loadingOlder = true, olderLoadError = null)
+        viewModelScope.launch {
+            when (val result = historySyncMutex.withLock { repository.syncConversationHistory(id, cursor) }) {
+                is RemoteResult.Success -> {
+                    if (_historyPaging.value.conversationId == id) {
+                        _historyPaging.value = _historyPaging.value.withPage(result.value, initial = false)
+                    }
+                }
+                is RemoteResult.Error -> {
+                    if (_historyPaging.value.conversationId == id) {
+                        _historyPaging.value = _historyPaging.value.copy(
+                            loadingOlder = false,
+                            olderLoadError = result.message,
+                        )
+                    }
+                    _notices.emit("Could not load older messages: ${result.message}")
+                }
+            }
         }
     }
 
     fun closeChat() {
+        stopTrackingOpenConversation()
         selectedChatId.value = null
+        _historyPaging.value = HistoryPagingState()
+    }
+
+    private fun scheduleLiveHistoryRefresh(conversationId: String) {
+        viewModelScope.launch {
+            if (trackedConversationId != conversationId || selectedChatId.value != conversationId) return@launch
+            if (chatScrollInProgress) {
+                liveHistoryRefreshPending = true
+                return@launch
+            }
+            if (selectedConversation.value?.state in setOf(ConversationState.SENDING, ConversationState.WORKING)) {
+                return@launch
+            }
+            liveHistoryRefreshPending = true
+            if (liveHistoryRefreshJob?.isActive == true) return@launch
+            liveHistoryRefreshJob = viewModelScope.launch {
+                delay(LIVE_HISTORY_REFRESH_INTERVAL_MS)
+                while (liveHistoryRefreshPending && trackedConversationId == conversationId) {
+                    liveHistoryRefreshPending = false
+                    when (val result = historySyncMutex.withLock {
+                        repository.syncConversationHistory(conversationId)
+                    }) {
+                        is RemoteResult.Success -> {
+                            if (_historyPaging.value.conversationId == conversationId) {
+                                _historyPaging.value = _historyPaging.value.withPage(
+                                    result.value,
+                                    initial = true,
+                                    cachedOldestAt = _historyPaging.value.oldestLoadedAt,
+                                )
+                            }
+                        }
+                        is RemoteResult.Error -> Unit
+                    }
+                    if (liveHistoryRefreshPending) delay(LIVE_HISTORY_REFRESH_INTERVAL_MS)
+                }
+            }
+        }
+    }
+
+    fun setChatScrollInProgress(inProgress: Boolean) {
+        if (chatScrollInProgress == inProgress) return
+        chatScrollInProgress = inProgress
+        if (!inProgress && liveHistoryRefreshPending) {
+            trackedConversationId?.let(::scheduleLiveHistoryRefresh)
+        }
+    }
+
+    fun setChatViewportAtLatest(atLatest: Boolean) {
+        if (chatViewportAtLatest == atLatest) return
+        chatViewportAtLatest = atLatest
+        if (atLatest && !chatScrollInProgress) {
+            trackedConversationId?.let(::scheduleLiveHistoryRefresh)
+        }
+    }
+
+    private suspend fun ensureOpenConversationSubscription(conversationId: String) {
+        val generation = conversationTrackingGeneration
+        if (
+            trackedConversationId != conversationId ||
+            selectedChatId.value != conversationId ||
+            openConversationSubscription != null ||
+            (
+                openConversationSubscriptionPendingFor == conversationId &&
+                    openConversationSubscriptionPendingGeneration == generation
+                )
+        ) {
+            return
+        }
+        openConversationSubscriptionPendingFor = conversationId
+        openConversationSubscriptionPendingGeneration = generation
+        val result = repository.subscribeConversation(conversationId) {
+            scheduleLiveHistoryRefresh(conversationId)
+        }
+        if (openConversationSubscriptionPendingGeneration == generation) {
+            openConversationSubscriptionPendingFor = null
+            openConversationSubscriptionPendingGeneration = -1L
+        }
+        when (result) {
+            is RemoteResult.Success -> {
+                if (
+                    conversationTrackingGeneration == generation &&
+                    trackedConversationId == conversationId &&
+                    selectedChatId.value == conversationId
+                ) {
+                    openConversationSubscription = result.value
+                } else {
+                    result.value?.close()
+                }
+            }
+            is RemoteResult.Error -> {
+                if (
+                    conversationTrackingGeneration == generation &&
+                    trackedConversationId == conversationId &&
+                    result.message.isActiveWriterConflict()
+                ) {
+                    openConversationSubscription = startOpenConversationPolling(conversationId, generation)
+                } else if (conversationTrackingGeneration == generation && trackedConversationId == conversationId) {
+                    _notices.emit("Live updates unavailable: ${result.message}")
+                }
+            }
+        }
+    }
+
+    private fun startOpenConversationPolling(conversationId: String, generation: Long): Closeable {
+        val job = viewModelScope.launch {
+            while (
+                conversationTrackingGeneration == generation &&
+                trackedConversationId == conversationId &&
+                selectedChatId.value == conversationId
+            ) {
+                delay(
+                    if (chatViewportAtLatest) {
+                        LIVE_HISTORY_POLL_INTERVAL_MS
+                    } else {
+                        BACKGROUND_HISTORY_POLL_INTERVAL_MS
+                    },
+                )
+                scheduleLiveHistoryRefresh(conversationId)
+            }
+        }
+        return Closeable { job.cancel() }
+    }
+
+    private fun stopTrackingOpenConversation() {
+        conversationTrackingGeneration += 1
+        trackedConversationId = null
+        openConversationSubscriptionPendingFor = null
+        openConversationSubscriptionPendingGeneration = -1L
+        openConversationSubscription?.close()
+        openConversationSubscription = null
+        liveHistoryRefreshJob?.cancel()
+        liveHistoryRefreshJob = null
+        liveHistoryRefreshPending = false
+        chatScrollInProgress = false
+        chatViewportAtLatest = true
+    }
+
+    override fun onCleared() {
+        stopTrackingOpenConversation()
+        super.onCleared()
     }
 
     fun setChatSearchQuery(query: String) {
@@ -179,7 +420,7 @@ class PuppyCoderViewModel(application: Application) : AndroidViewModel(applicati
         viewModelScope.launch {
             runCatching {
                 val id = repository.createConversation(computerId, workspace)
-                selectedChatId.value = id
+                openChat(id)
                 firstMessage.takeIf(String::isNotBlank)?.let { repository.sendMessage(id, it) }
             }.onFailure { _notices.emit(it.message ?: "Could not create chat") }
         }
@@ -356,6 +597,50 @@ data class ChatSyncState(
     val error: String? = null,
 )
 
+data class HistoryPagingState(
+    val conversationId: String? = null,
+    val openedAt: Long = Long.MAX_VALUE,
+    val initialLoading: Boolean = false,
+    val loadingOlder: Boolean = false,
+    val oldestLoadedAt: Long? = null,
+    val nextCursor: String? = null,
+    val allHistoryLoaded: Boolean = false,
+    val olderPageVersion: Int = 0,
+    val olderLoadError: String? = null,
+) {
+    val hasOlder: Boolean get() = nextCursor != null
+
+    fun withPage(
+        page: com.puppycoder.relay.data.HistorySyncPage,
+        initial: Boolean,
+        cachedOldestAt: Long? = null,
+    ): HistoryPagingState {
+        val oldest = listOfNotNull(oldestLoadedAt, page.oldestMessageAt, cachedOldestAt).minOrNull()
+        return copy(
+            initialLoading = false,
+            loadingOlder = false,
+            oldestLoadedAt = oldest,
+            nextCursor = page.nextCursor,
+            allHistoryLoaded = page.nextCursor == null,
+            olderPageVersion = if (initial) olderPageVersion else olderPageVersion + 1,
+            olderLoadError = null,
+        )
+    }
+}
+
+internal fun visibleMessagesForHistory(
+    messages: List<ChatMessage>,
+    paging: HistoryPagingState,
+): List<ChatMessage> = when {
+    paging.conversationId == null || paging.initialLoading || paging.allHistoryLoaded -> messages
+    paging.oldestLoadedAt == null -> messages.filter {
+        it.remoteMessageId == null || it.createdAt >= paging.openedAt
+    }
+    else -> messages.filter {
+        it.remoteMessageId == null || it.createdAt >= paging.openedAt || it.createdAt >= paging.oldestLoadedAt
+    }
+}
+
 data class ServerDiscoveryState(
     val tunnelId: String? = null,
     val tunnelName: String = "",
@@ -364,3 +649,10 @@ data class ServerDiscoveryState(
     val addedCount: Int = 0,
     val error: String? = null,
 )
+
+private const val LIVE_HISTORY_REFRESH_INTERVAL_MS = 500L
+private const val LIVE_HISTORY_POLL_INTERVAL_MS = 2_000L
+private const val BACKGROUND_HISTORY_POLL_INTERVAL_MS = 8_000L
+
+private fun String.isActiveWriterConflict(): Boolean =
+    contains("active writer", ignoreCase = true)

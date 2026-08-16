@@ -61,6 +61,12 @@ class CodexConnectionManagerTest {
                 1,
                 factory.sockets.single().sent.count { it.optString("method") == "initialize" },
             )
+            val initialize = factory.sockets.single().sent.single { it.optString("method") == "initialize" }
+            assertTrue(
+                initialize.getJSONObject("params")
+                    .getJSONObject("capabilities")
+                    .getBoolean("experimentalApi"),
+            )
         } finally {
             connection.close()
             scope.cancel()
@@ -96,6 +102,53 @@ class CodexConnectionManagerTest {
             connection.close()
             scope.cancel()
             factory.close()
+        }
+    }
+
+    @Test
+    fun unsubscribesOnlyAfterLastObserverAndResumesWhenObservedAgain() = runBlocking {
+        withTimeout(10_000) {
+            val factory = FakeWebSocketFactory()
+            val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+            factory.onRequest = { socket, message ->
+                val result = when (message.optString("method")) {
+                    "thread/resume" -> JSONObject().put(
+                        "thread",
+                        JSONObject().put("id", message.getJSONObject("params").getString("threadId")),
+                    )
+                    else -> JSONObject()
+                }
+                socket.respond(message.getLong("id"), result)
+            }
+
+            val connection = CodexConnection(factory, REQUEST, scope)
+            try {
+                val first = connection.observe("thread-1", { null }) { }
+                val second = connection.observe("thread-1", { null }) { }
+                connection.attachThread("thread-1", JSONObject().put("cwd", "/workspace"))
+
+                first.close()
+                delay(100)
+                assertEquals(
+                    0,
+                    factory.sockets.single().sent.count { it.optString("method") == "thread/unsubscribe" },
+                )
+
+                second.close()
+                while (factory.sockets.single().sent.none { it.optString("method") == "thread/unsubscribe" }) delay(25)
+
+                val reopened = connection.observe("thread-1", { null }) { }
+                connection.attachThread("thread-1", JSONObject().put("cwd", "/workspace"))
+                assertEquals(
+                    2,
+                    factory.sockets.single().sent.count { it.optString("method") == "thread/resume" },
+                )
+                reopened.close()
+            } finally {
+                connection.close()
+                scope.cancel()
+                factory.close()
+            }
         }
     }
 

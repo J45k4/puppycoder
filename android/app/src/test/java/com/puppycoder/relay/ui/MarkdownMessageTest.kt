@@ -35,4 +35,25 @@ class MarkdownMessageTest {
         assertTrue(blocks.single() is MarkdownBlock.Code)
         assertEquals("hello", (blocks.single() as MarkdownBlock.Code).text)
     }
+
+    @Test
+    fun parsesAlignedMarkdownTable() {
+        val blocks = parseMarkdownBlocks(
+            """
+            | Metric | Before | Optimized |
+            |:---|---:|:---:|
+            | Janky frames | 6.71% | 6.67% median |
+            | Escaped | one \| two | `a|b` |
+            """.trimIndent(),
+        )
+
+        val table = blocks.single() as MarkdownBlock.Table
+        assertEquals(listOf("Metric", "Before", "Optimized"), table.headers)
+        assertEquals(
+            listOf(MarkdownTableAlignment.START, MarkdownTableAlignment.END, MarkdownTableAlignment.CENTER),
+            table.alignments,
+        )
+        assertEquals(listOf("Janky frames", "6.71%", "6.67% median"), table.rows[0])
+        assertEquals(listOf("Escaped", "one | two", "`a|b`"), table.rows[1])
+    }
 }

@@ -1,5 +1,6 @@
 package com.puppycoder.relay.data
 
+import java.io.Closeable
 import java.util.UUID
 
 enum class ConversationState {
@@ -120,6 +121,17 @@ data class RemoteChatMessage(
     val activities: List<RemoteChatActivity> = emptyList(),
 )
 
+data class RemoteChatPage(
+    val messages: List<RemoteChatMessage>,
+    val nextCursor: String? = null,
+)
+
+data class HistorySyncPage(
+    val importedCount: Int,
+    val oldestMessageAt: Long?,
+    val nextCursor: String? = null,
+)
+
 data class RemoteChatActivity(
     val remoteId: String,
     val title: String,
@@ -182,7 +194,14 @@ interface AgentConversationClient {
     suspend fun loadConversation(
         computer: RelayServer,
         remoteConversationId: String,
-    ): RemoteResult<List<RemoteChatMessage>>
+        cursor: String? = null,
+        limit: Int = 40,
+    ): RemoteResult<RemoteChatPage>
+    suspend fun subscribeConversation(
+        computer: RelayServer,
+        remoteConversationId: String,
+        onChanged: () -> Unit,
+    ): RemoteResult<Closeable?>
     suspend fun testTunnel(
         profile: SshTunnelProfile,
         computerEndpoints: List<String>,

@@ -1,6 +1,7 @@
 package com.puppycoder.relay.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -15,6 +16,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -30,6 +32,7 @@ import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
@@ -39,7 +42,26 @@ internal sealed interface MarkdownBlock {
     data class Code(val language: String?, val text: String) : MarkdownBlock
     data class Quote(val text: String) : MarkdownBlock
     data class ListItem(val marker: String, val text: String) : MarkdownBlock
+    data class Table(
+        val headers: List<String>,
+        val alignments: List<MarkdownTableAlignment>,
+        val rows: List<List<String>>,
+    ) : MarkdownBlock
 }
+
+internal enum class MarkdownTableAlignment { START, CENTER, END }
+
+private val fencedCodeStart = Regex("^\\s*```(.*)$")
+private val fencedCodeEnd = Regex("^\\s*```\\s*$")
+private val headingStart = Regex("^(#{1,6})\\s+(.+)$")
+private val quoteStart = Regex("^\\s*>\\s?(.*)$")
+private val unorderedItemStart = Regex("^\\s*[-+*]\\s+(.+)$")
+private val orderedItemStart = Regex("^\\s*(\\d+)\\.\\s+(.+)$")
+private val anyFencedCodeStart = Regex("^\\s*```")
+private val anyHeadingStart = Regex("^#{1,6}\\s+")
+private val anyQuoteStart = Regex("^\\s*>\\s?")
+private val anyUnorderedItemStart = Regex("^\\s*[-+*]\\s+")
+private val anyOrderedItemStart = Regex("^\\s*\\d+\\.\\s+")
 
 @Composable
 internal fun MarkdownMessage(text: String, modifier: Modifier = Modifier) {
@@ -81,6 +103,7 @@ internal fun MarkdownMessage(text: String, modifier: Modifier = Modifier) {
                     MarkdownText(block.text, linkColor, Modifier.weight(1f))
                 }
                 is MarkdownBlock.Code -> CodeBlock(block)
+                is MarkdownBlock.Table -> MarkdownTable(block, linkColor)
             }
         }
     }
@@ -94,6 +117,7 @@ private fun MarkdownText(
     color: Color = Color.Unspecified,
     fontWeight: FontWeight? = null,
     fontSize: Int = 15,
+    textAlign: TextAlign? = null,
 ) {
     val formatted = remember(text, linkColor) { inlineMarkdown(text, linkColor) }
     SelectionContainer(modifier = modifier) {
@@ -103,7 +127,64 @@ private fun MarkdownText(
             fontWeight = fontWeight,
             fontSize = fontSize.sp,
             lineHeight = (fontSize + 6).sp,
+            textAlign = textAlign,
         )
+    }
+}
+
+@Composable
+private fun MarkdownTable(block: MarkdownBlock.Table, linkColor: Color) {
+    val columnWidths = remember(block) {
+        block.headers.indices.map { column ->
+            val longest = sequenceOf(block.headers[column])
+                .plus(block.rows.asSequence().map { it.getOrElse(column) { "" } })
+                .maxOf(String::length)
+            (longest * 7 + 24).coerceIn(96, 220).dp
+        }
+    }
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(8.dp),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        color = MaterialTheme.colorScheme.surface.copy(alpha = .45f),
+    ) {
+        Column(Modifier.horizontalScroll(rememberScrollState())) {
+            MarkdownTableRow(block.headers, block.alignments, columnWidths, linkColor, header = true)
+            HorizontalDivider()
+            block.rows.forEachIndexed { index, row ->
+                MarkdownTableRow(row, block.alignments, columnWidths, linkColor, header = false)
+                if (index != block.rows.lastIndex) HorizontalDivider()
+            }
+        }
+    }
+}
+
+@Composable
+private fun MarkdownTableRow(
+    cells: List<String>,
+    alignments: List<MarkdownTableAlignment>,
+    columnWidths: List<androidx.compose.ui.unit.Dp>,
+    linkColor: Color,
+    header: Boolean,
+) {
+    Row {
+        columnWidths.indices.forEach { column ->
+            if (column > 0) {
+                Box(Modifier.width(1.dp).heightIn(min = 38.dp).background(MaterialTheme.colorScheme.outlineVariant))
+            }
+            MarkdownText(
+                text = cells.getOrElse(column) { "" },
+                linkColor = linkColor,
+                modifier = Modifier.width(columnWidths[column]).padding(horizontal = 10.dp, vertical = 8.dp),
+                fontWeight = if (header) FontWeight.SemiBold else null,
+                fontSize = 13,
+                textAlign = when (alignments.getOrElse(column) { MarkdownTableAlignment.START }) {
+                    MarkdownTableAlignment.START -> TextAlign.Start
+                    MarkdownTableAlignment.CENTER -> TextAlign.Center
+                    MarkdownTableAlignment.END -> TextAlign.End
+                },
+            )
+        }
     }
 }
 
@@ -152,12 +233,12 @@ internal fun parseMarkdownBlocks(source: String): List<MarkdownBlock> {
             continue
         }
 
-        val fence = Regex("^\\s*```(.*)$").matchEntire(line)
+        val fence = fencedCodeStart.matchEntire(line)
         if (fence != null) {
             val language = fence.groupValues[1].trim().ifEmpty { null }
             val code = mutableListOf<String>()
             index++
-            while (index < lines.size && !Regex("^\\s*```\\s*$").matches(lines[index])) {
+            while (index < lines.size && !fencedCodeEnd.matches(lines[index])) {
                 code += lines[index++]
             }
             if (index < lines.size) index++
@@ -165,25 +246,33 @@ internal fun parseMarkdownBlocks(source: String): List<MarkdownBlock> {
             continue
         }
 
-        val heading = Regex("^(#{1,6})\\s+(.+)$").matchEntire(line)
+        val parsedTable = parseMarkdownTable(lines, index)
+        if (parsedTable != null) {
+            val (table, nextIndex) = parsedTable
+            blocks += table
+            index = nextIndex
+            continue
+        }
+
+        val heading = headingStart.matchEntire(line)
         if (heading != null) {
             blocks += MarkdownBlock.Heading(heading.groupValues[1].length, heading.groupValues[2])
             index++
             continue
         }
-        val quote = Regex("^\\s*>\\s?(.*)$").matchEntire(line)
+        val quote = quoteStart.matchEntire(line)
         if (quote != null) {
             blocks += MarkdownBlock.Quote(quote.groupValues[1])
             index++
             continue
         }
-        val unorderedItem = Regex("^\\s*[-+*]\\s+(.+)$").matchEntire(line)
+        val unorderedItem = unorderedItemStart.matchEntire(line)
         if (unorderedItem != null) {
             blocks += MarkdownBlock.ListItem("•", unorderedItem.groupValues[1])
             index++
             continue
         }
-        val orderedItem = Regex("^\\s*(\\d+)\\.\\s+(.+)$").matchEntire(line)
+        val orderedItem = orderedItemStart.matchEntire(line)
         if (orderedItem != null) {
             blocks += MarkdownBlock.ListItem("${orderedItem.groupValues[1]}.", orderedItem.groupValues[2])
             index++
@@ -200,12 +289,70 @@ internal fun parseMarkdownBlocks(source: String): List<MarkdownBlock> {
     return blocks.ifEmpty { listOf(MarkdownBlock.Paragraph("")) }
 }
 
+private fun parseMarkdownTable(lines: List<String>, start: Int): Pair<MarkdownBlock.Table, Int>? {
+    if (start + 1 >= lines.size || '|' !in lines[start]) return null
+    val headers = splitMarkdownTableRow(lines[start])
+    val separators = splitMarkdownTableRow(lines[start + 1])
+    if (headers.size < 2 || separators.size != headers.size || separators.any { !isTableSeparator(it) }) return null
+    val alignments = separators.map { separator ->
+        val trimmed = separator.trim()
+        when {
+            trimmed.startsWith(':') && trimmed.endsWith(':') -> MarkdownTableAlignment.CENTER
+            trimmed.endsWith(':') -> MarkdownTableAlignment.END
+            else -> MarkdownTableAlignment.START
+        }
+    }
+    val rows = mutableListOf<List<String>>()
+    var index = start + 2
+    while (index < lines.size && lines[index].isNotBlank() && '|' in lines[index]) {
+        val cells = splitMarkdownTableRow(lines[index])
+        rows += List(headers.size) { column -> cells.getOrElse(column) { "" } }
+        index++
+    }
+    return MarkdownBlock.Table(headers, alignments, rows) to index
+}
+
+private fun isTableSeparator(cell: String): Boolean {
+    val trimmed = cell.trim()
+    val core = trimmed.removePrefix(":").removeSuffix(":")
+    return core.length >= 3 && core.all { it == '-' }
+}
+
+private fun splitMarkdownTableRow(line: String): List<String> {
+    val source = line.trim().removePrefix("|").removeSuffix("|")
+    val cells = mutableListOf<String>()
+    val cell = StringBuilder()
+    var escaped = false
+    var inCode = false
+    source.forEach { character ->
+        when {
+            escaped -> {
+                cell.append(character)
+                escaped = false
+            }
+            character == '\\' -> escaped = true
+            character == '`' -> {
+                inCode = !inCode
+                cell.append(character)
+            }
+            character == '|' && !inCode -> {
+                cells += cell.toString().trim()
+                cell.clear()
+            }
+            else -> cell.append(character)
+        }
+    }
+    if (escaped) cell.append('\\')
+    cells += cell.toString().trim()
+    return cells
+}
+
 private fun startsMarkdownBlock(line: String): Boolean =
-    Regex("^\\s*```").containsMatchIn(line) ||
-        Regex("^#{1,6}\\s+").containsMatchIn(line) ||
-        Regex("^\\s*>\\s?").containsMatchIn(line) ||
-        Regex("^\\s*[-+*]\\s+").containsMatchIn(line) ||
-        Regex("^\\s*\\d+\\.\\s+").containsMatchIn(line)
+    anyFencedCodeStart.containsMatchIn(line) ||
+        anyHeadingStart.containsMatchIn(line) ||
+        anyQuoteStart.containsMatchIn(line) ||
+        anyUnorderedItemStart.containsMatchIn(line) ||
+        anyOrderedItemStart.containsMatchIn(line)
 
 private fun inlineMarkdown(source: String, linkColor: Color): AnnotatedString = buildAnnotatedString {
     fun appendRange(value: String) {

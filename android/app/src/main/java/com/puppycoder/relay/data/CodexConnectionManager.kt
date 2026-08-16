@@ -154,7 +154,29 @@ internal class CodexConnection(
     ): Closeable {
         val observer = NotificationObserver(threadId, turnId, onNotification)
         observers += observer
-        return Closeable { observers.remove(observer) }
+        val released = AtomicBoolean(false)
+        return Closeable {
+            if (released.compareAndSet(false, true) && observers.remove(observer)) {
+                scope.launch { unsubscribeThreadIfUnused(threadId) }
+            }
+        }
+    }
+
+    private suspend fun unsubscribeThreadIfUnused(threadId: String) {
+        val lock = attachmentLocks.getOrPut(threadId) { Mutex() }
+        lock.withLock {
+            if (observers.any { it.threadId == threadId }) return
+            val attachment = attachments[threadId] ?: return
+            val activeGeneration = generation.get()
+            if (socket == null || attachment.generation != activeGeneration) {
+                attachment.generation = 0
+                return
+            }
+            attachment.generation = 0
+            runCatching {
+                requestWithGeneration("thread/unsubscribe", JSONObject().put("threadId", threadId))
+            }
+        }
     }
 
     private suspend fun awaitSocket(): WebSocket {
@@ -183,13 +205,18 @@ internal class CodexConnection(
                     .put("method", "initialize")
                     .put(
                         "params",
-                        JSONObject().put(
-                            "clientInfo",
-                            JSONObject()
-                                .put("name", "puppycoder_android")
-                                .put("title", "PuppyCoder for Android")
-                                .put("version", PUPPYCODER_CLIENT_VERSION),
-                        ),
+                        JSONObject()
+                            .put(
+                                "clientInfo",
+                                JSONObject()
+                                    .put("name", "puppycoder_android")
+                                    .put("title", "PuppyCoder for Android")
+                                    .put("version", PUPPYCODER_CLIENT_VERSION),
+                            )
+                            .put(
+                                "capabilities",
+                                JSONObject().put("experimentalApi", true),
+                            ),
                     )
                 if (!webSocket.send(initialize.toString())) {
                     disconnect(webSocket, IOException("Could not initialize Codex connection"))

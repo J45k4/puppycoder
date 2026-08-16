@@ -23,6 +23,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.Closeable
 import java.io.File
 import java.io.IOException
 import java.security.MessageDigest
@@ -44,6 +45,7 @@ class ConversationRemoteClient(
     private val sshTunnels = SshTunnelManager()
     private val codexConnections = CodexConnectionManager(http, scope)
     private val activeRuns = ConcurrentHashMap<String, ActiveRun>()
+    private val stableCodexHistoryComputers = ConcurrentHashMap.newKeySet<String>()
     @Volatile private var tunnelProfiles: List<SshTunnelProfile> = emptyList()
 
     override fun setTunnelProfiles(profiles: List<SshTunnelProfile>) {
@@ -235,14 +237,43 @@ class ConversationRemoteClient(
     override suspend fun loadConversation(
         computer: RelayServer,
         remoteConversationId: String,
-    ): RemoteResult<List<RemoteChatMessage>> {
+        cursor: String?,
+        limit: Int,
+    ): RemoteResult<RemoteChatPage> {
         val endpoint = withContext(Dispatchers.IO) {
             runCatching { sshTunnels.route(computer, tunnelProfiles) }
         }.getOrElse { return RemoteResult.Error(it.conversationMessage()) }
         return when (computer.kind) {
-            ServerKind.CODEX -> loadCodexConversation(computer, endpoint.url, remoteConversationId)
-            ServerKind.OPENCODE -> loadOpenCodeConversation(computer, endpoint.url, remoteConversationId)
+            ServerKind.CODEX -> loadCodexConversation(computer, endpoint.url, remoteConversationId, cursor, limit)
+            ServerKind.OPENCODE -> loadOpenCodeConversation(computer, endpoint.url, remoteConversationId, cursor, limit)
         }
+    }
+
+    override suspend fun subscribeConversation(
+        computer: RelayServer,
+        remoteConversationId: String,
+        onChanged: () -> Unit,
+    ): RemoteResult<Closeable?> {
+        if (computer.kind != ServerKind.CODEX) return RemoteResult.Success(null)
+        val endpoint = withContext(Dispatchers.IO) {
+            runCatching { sshTunnels.route(computer, tunnelProfiles) }
+        }.getOrElse { return RemoteResult.Error(it.conversationMessage()) }
+        return runCatching {
+            val connection = codexConnections.connection(
+                computer.id,
+                computer.authorizedRequest(endpoint.url.conversationWebSocketBase()).build(),
+            )
+            val observer = connection.observe(remoteConversationId, { null }) { message ->
+                if (message.optString("method").updatesOpenConversation()) onChanged()
+            }
+            try {
+                connection.attachThread(remoteConversationId, JSONObject())
+                RemoteResult.Success(observer)
+            } catch (error: Throwable) {
+                observer.close()
+                throw error
+            }
+        }.getOrElse { RemoteResult.Error(it.conversationMessage()) }
     }
 
     private suspend fun listCodexConversations(
@@ -334,19 +365,77 @@ class ConversationRemoteClient(
         computer: RelayServer,
         endpoint: String,
         remoteConversationId: String,
-    ): RemoteResult<List<RemoteChatMessage>> {
-        val params = JSONObject().put("threadId", remoteConversationId).put("includeTurns", true)
+        cursor: String?,
+        limit: Int,
+    ): RemoteResult<RemoteChatPage> {
+        if (cursor == null && computer.id in stableCodexHistoryComputers) {
+            return loadStableCodexConversation(computer, endpoint, remoteConversationId)
+        }
+        val params = JSONObject()
+            .put("threadId", remoteConversationId)
+            .put("limit", limit)
+            .put("sortDirection", "desc")
+            .put("itemsView", "full")
+        cursor?.let { params.put("cursor", it) }
+        return when (val response = codexRpcRequest(computer, endpoint, "thread/turns/list", params)) {
+            is RemoteResult.Error -> if (cursor == null && response.message.requiresStableCodexHistory()) {
+                stableCodexHistoryComputers += computer.id
+                loadStableCodexConversation(computer, endpoint, remoteConversationId)
+            } else {
+                response
+            }
+            is RemoteResult.Success -> parseCodexConversationPage(
+                remoteConversationId = remoteConversationId,
+                turns = response.value.optJSONArray("data") ?: JSONArray(),
+                fallbackTime = System.currentTimeMillis(),
+                nextCursor = if (response.value.isNull("nextCursor")) {
+                    null
+                } else {
+                    response.value.optString("nextCursor").takeIf(String::isNotBlank)
+                },
+                fallbackStep = -1_000L,
+            )
+        }
+    }
+
+    private suspend fun loadStableCodexConversation(
+        computer: RelayServer,
+        endpoint: String,
+        remoteConversationId: String,
+    ): RemoteResult<RemoteChatPage> {
+        val params = JSONObject()
+            .put("threadId", remoteConversationId)
+            .put("includeTurns", true)
         return when (val response = codexRpcRequest(computer, endpoint, "thread/read", params)) {
             is RemoteResult.Error -> response
             is RemoteResult.Success -> runCatching {
                 val thread = response.value.getJSONObject("thread")
-                val fallbackTime = thread.optLong("createdAt") * 1_000L
-                val messages = buildList {
-                    val turns = thread.optJSONArray("turns") ?: JSONArray()
-                    for (turnIndex in 0 until turns.length()) {
+                parseCodexConversationPage(
+                    remoteConversationId = remoteConversationId,
+                    turns = thread.optJSONArray("turns") ?: JSONArray(),
+                    fallbackTime = thread.optLong("createdAt")
+                        .takeIf { it > 0 }
+                        ?.times(1_000L)
+                        ?: System.currentTimeMillis(),
+                    nextCursor = null,
+                    fallbackStep = 1_000L,
+                )
+            }.getOrElse { RemoteResult.Error(it.conversationMessage()) }
+        }
+    }
+
+    private fun parseCodexConversationPage(
+        remoteConversationId: String,
+        turns: JSONArray,
+        fallbackTime: Long,
+        nextCursor: String?,
+        fallbackStep: Long,
+    ): RemoteResult<RemoteChatPage> = runCatching {
+        val messages = buildList {
+            for (turnIndex in 0 until turns.length()) {
                         val turn = turns.getJSONObject(turnIndex)
                         val turnTime = turn.optLong("startedAt").takeIf { it > 0 }?.times(1_000L)
-                            ?: (fallbackTime + turnIndex * 1_000L)
+                            ?: (fallbackTime + turnIndex * fallbackStep)
                         val items = turn.optJSONArray("items") ?: JSONArray()
                         val finalAgentIndex = (0 until items.length())
                             .filter { items.optJSONObject(it)?.optString("type") == "agentMessage" }
@@ -431,23 +520,26 @@ class ConversationRemoteClient(
                                 ),
                             )
                         }
-                    }
-                }
-                RemoteResult.Success(messages)
-            }.getOrElse { RemoteResult.Error(it.conversationMessage()) }
+            }
         }
-    }
+        RemoteResult.Success(RemoteChatPage(messages = messages, nextCursor = nextCursor))
+    }.getOrElse { RemoteResult.Error(it.conversationMessage()) }
 
     private suspend fun loadOpenCodeConversation(
         computer: RelayServer,
         endpoint: String,
         remoteConversationId: String,
-    ): RemoteResult<List<RemoteChatMessage>> = withContext(Dispatchers.IO) {
+        cursor: String?,
+        limit: Int,
+    ): RemoteResult<RemoteChatPage> = withContext(Dispatchers.IO) {
         runCatching {
             val url = endpoint.conversationHttpBase() + "/session/$remoteConversationId/message" +
-                "?directory=${computer.workspace.conversationUrlEncode()}"
+                "?directory=${computer.workspace.conversationUrlEncode()}&limit=$limit" +
+                cursor?.let { "&before=${it.conversationUrlEncode()}" }.orEmpty()
+            var nextCursor: String? = null
             val history = http.newCall(computer.authorizedRequest(url).get().build()).execute().use { response ->
                 if (!response.isSuccessful) error("Could not load OpenCode history: HTTP ${response.code}")
+                nextCursor = response.header("X-Next-Cursor")?.takeIf(String::isNotBlank)
                 JSONArray(response.body?.string().orEmpty())
             }
             val messages = buildList {
@@ -529,7 +621,7 @@ class ConversationRemoteClient(
                     )
                 }
             }
-            RemoteResult.Success(messages)
+            RemoteResult.Success(RemoteChatPage(messages, nextCursor))
         }.getOrElse { RemoteResult.Error(it.conversationMessage()) }
     }
 
@@ -638,7 +730,7 @@ class ConversationRemoteClient(
             .put("sandbox", "workspace-write")
         val threadId = try {
             request.remoteConversationId?.also {
-                connection.attachThread(it, threadOverrides)
+                connection.attachThread(it, JSONObject())
             } ?: connection.startThread(threadOverrides)
         } catch (error: Throwable) {
             onEvent(AgentConversationEvent.Failed(error.conversationMessage(), deliveryWasAccepted = false))
@@ -743,6 +835,15 @@ class ConversationRemoteClient(
                 .put("threadId", threadId)
                 .put("clientUserMessageId", request.clientMessageId)
                 .put("input", input)
+                .put("cwd", request.workspace)
+                .put("approvalPolicy", "never")
+                .put(
+                    "sandboxPolicy",
+                    JSONObject()
+                        .put("type", "workspaceWrite")
+                        .put("writableRoots", JSONArray().put(request.workspace))
+                        .put("networkAccess", false),
+                )
             request.modelId?.let { turnParams.put("model", it) }
             val result = connection.request("turn/start", turnParams)
             turnId = result.getJSONObject("turn").getString("id")
@@ -1058,6 +1159,17 @@ private fun String.conversationHumanize(): String = replace(Regex("([a-z])([A-Z]
     .replaceFirstChar { it.uppercase() }
 
 private fun Throwable.conversationMessage(): String = message?.takeIf(String::isNotBlank) ?: "Connection failed"
+
+internal fun String.requiresStableCodexHistory(): Boolean {
+    val normalized = lowercase()
+    return "experimentalapi" in normalized ||
+        "method not found" in normalized ||
+        "unsupported method" in normalized ||
+        ("thread/turns/list" in normalized && "not supported" in normalized)
+}
+
+internal fun String.updatesOpenConversation(): Boolean =
+    startsWith("turn/") || startsWith("item/") || this == "thread/status/changed"
 
 private fun MessageImage.dataUrl(): String {
     val file = File(filePath)
