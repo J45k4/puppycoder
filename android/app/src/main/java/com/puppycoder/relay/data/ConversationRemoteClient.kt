@@ -26,6 +26,7 @@ import org.json.JSONObject
 import java.io.Closeable
 import java.io.File
 import java.io.IOException
+import java.io.OutputStream
 import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
@@ -273,6 +274,20 @@ class ConversationRemoteClient(
                 observer.close()
                 throw error
             }
+        }.getOrElse { RemoteResult.Error(it.conversationMessage()) }
+    }
+
+    override suspend fun downloadFile(
+        computer: RelayServer,
+        remotePath: String,
+        output: OutputStream,
+        maxBytes: Long,
+        onProgress: (RemoteFileProgress) -> Unit,
+    ): RemoteResult<RemoteFileDownload> = withContext(Dispatchers.IO) {
+        runCatching {
+            RemoteResult.Success(
+                sshTunnels.readFile(computer, tunnelProfiles, remotePath, output, maxBytes, onProgress),
+            )
         }.getOrElse { RemoteResult.Error(it.conversationMessage()) }
     }
 
@@ -771,7 +786,7 @@ class ConversationRemoteClient(
                                 AgentConversationEvent.ToolStarted(
                                     item.optString("id", type),
                                     if (type == "reasoning") "Thinking" else type.conversationHumanize(),
-                                    item.optString("command"),
+                                    if (type == "reasoning") "" else item.historicalActivityDetail(),
                                 ),
                             )
                         }
@@ -791,7 +806,7 @@ class ConversationRemoteClient(
                                         .orEmpty()
                                 }
                             } else {
-                                status
+                                item.historicalActivityDetail().ifBlank { status }
                             }
                             onEvent(
                                 AgentConversationEvent.ToolCompleted(

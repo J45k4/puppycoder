@@ -405,6 +405,13 @@ private class FakeConversationClient : AgentConversationClient {
         remoteConversationId: String,
         onChanged: () -> Unit,
     ) = RemoteResult.Success(null)
+    override suspend fun downloadFile(
+        computer: RelayServer,
+        remotePath: String,
+        output: java.io.OutputStream,
+        maxBytes: Long,
+        onProgress: (RemoteFileProgress) -> Unit,
+    ): RemoteResult<RemoteFileDownload> = RemoteResult.Error("No remote files in test")
     override suspend fun testTunnel(profile: SshTunnelProfile, computerEndpoints: List<String>) =
         RemoteResult.Success(SshTunnelTest("ok", 1))
     override suspend fun discoverServers(profile: SshTunnelProfile) =

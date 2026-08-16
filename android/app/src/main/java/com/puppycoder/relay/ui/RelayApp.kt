@@ -5,6 +5,7 @@ import android.content.Intent
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.provider.Settings
+import androidx.core.content.FileProvider
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
@@ -13,6 +14,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -36,6 +38,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
@@ -60,6 +63,7 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -101,6 +105,7 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
@@ -118,9 +123,11 @@ import com.puppycoder.relay.data.Conversation
 import com.puppycoder.relay.data.ConversationState
 import com.puppycoder.relay.data.DeliveryState
 import com.puppycoder.relay.data.DiscoveredAgentServer
+import com.puppycoder.relay.data.DownloadedRemoteFile
 import com.puppycoder.relay.data.MessageImage
 import com.puppycoder.relay.data.MessageRole
 import com.puppycoder.relay.data.RelayServer
+import com.puppycoder.relay.data.RemoteResult
 import com.puppycoder.relay.data.ServerKind
 import com.puppycoder.relay.data.ServerRouteMode
 import com.puppycoder.relay.data.SshTunnelConfig
@@ -128,6 +135,7 @@ import com.puppycoder.relay.data.SshTunnelProfile
 import com.puppycoder.relay.data.ToolActivity
 import com.puppycoder.relay.data.ToolActivityState
 import com.puppycoder.relay.data.TunnelRouteRule
+import com.puppycoder.relay.data.remoteFileReferenceFromActivity
 import com.puppycoder.relay.update.AppUpdateState
 import com.puppycoder.relay.ui.theme.RelayAmber
 import com.puppycoder.relay.ui.theme.RelayGreen
@@ -136,6 +144,7 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.UUID
+import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -162,6 +171,7 @@ fun RelayApp(viewModel: PuppyCoderViewModel = viewModel()) {
     val chatGroupMode by viewModel.chatGroupMode.collectAsState()
     val collapsedChatGroups by viewModel.collapsedChatGroups.collectAsState()
     val appUpdate by viewModel.appUpdate.collectAsState()
+    val remoteFileViewer by viewModel.remoteFileViewer.collectAsState()
     val snackbar = remember { SnackbarHostState() }
     val context = LocalContext.current
     var screen by rememberSaveable { mutableStateOf(MainScreen.CHATS) }
@@ -243,6 +253,17 @@ fun RelayApp(viewModel: PuppyCoderViewModel = viewModel()) {
             onLoadOlder = viewModel::loadOlderMessages,
             onScrollStateChanged = viewModel::setChatScrollInProgress,
             onViewportAtLatestChanged = viewModel::setChatViewportAtLatest,
+            onOpenRemoteFile = { reference, allowOutsideWorkspace ->
+                viewModel.openRemoteFile(reference, allowOutsideWorkspace)
+            },
+            onLoadRemoteFile = { reference, allowOutsideWorkspace ->
+                viewModel.loadRemoteFile(
+                    checkNotNull(conversation).id,
+                    reference,
+                    allowOutsideWorkspace,
+                )
+            },
+            onShowRemoteFile = viewModel::showRemoteFile,
             snackbar = snackbar,
             appUpdate = appUpdate,
             onUpdateAction = {
@@ -439,6 +460,14 @@ fun RelayApp(viewModel: PuppyCoderViewModel = viewModel()) {
                 TextButton(onClick = { showUpdatePrompt = false }) { Text("Later") }
             },
         )
+    }
+
+    if (
+        remoteFileViewer.loadingReference != null ||
+        remoteFileViewer.file != null ||
+        remoteFileViewer.error != null
+    ) {
+        RemoteFileViewerDialog(remoteFileViewer, viewModel::closeRemoteFile)
     }
 }
 
@@ -804,6 +833,9 @@ private fun ConversationScreen(
     onLoadOlder: () -> Unit,
     onScrollStateChanged: (Boolean) -> Unit,
     onViewportAtLatestChanged: (Boolean) -> Unit,
+    onOpenRemoteFile: (String, Boolean) -> Unit,
+    onLoadRemoteFile: suspend (String, Boolean) -> RemoteResult<DownloadedRemoteFile>,
+    onShowRemoteFile: (DownloadedRemoteFile) -> Unit,
     snackbar: SnackbarHostState,
     appUpdate: AppUpdateState,
     onUpdateAction: () -> Unit,
@@ -1036,6 +1068,9 @@ private fun ConversationScreen(
                     computerName = computerName,
                     onRetry = { onRetry(message.id) },
                     onRemove = { onRemove(message.id) },
+                    onOpenRemoteFile = onOpenRemoteFile,
+                    onLoadRemoteFile = onLoadRemoteFile,
+                    onShowRemoteFile = onShowRemoteFile,
                 )
             }
             if (arrangedMessages.unboundActivities.isNotEmpty()) {
@@ -1043,6 +1078,9 @@ private fun ConversationScreen(
                     ThinkingBlock(
                         activities = arrangedMessages.unboundActivities,
                         groupKey = "${conversation.id}-unbound",
+                        onOpenRemoteFile = onOpenRemoteFile,
+                        onLoadRemoteFile = onLoadRemoteFile,
+                        onShowRemoteFile = onShowRemoteFile,
                     )
                 }
             }
@@ -1177,6 +1215,9 @@ private fun MessageBubble(
     computerName: String,
     onRetry: () -> Unit,
     onRemove: () -> Unit,
+    onOpenRemoteFile: (String, Boolean) -> Unit,
+    onLoadRemoteFile: suspend (String, Boolean) -> RemoteResult<DownloadedRemoteFile>,
+    onShowRemoteFile: (DownloadedRemoteFile) -> Unit,
 ) {
     val outgoing = message.role == MessageRole.USER
     Column(
@@ -1203,6 +1244,7 @@ private fun MessageBubble(
                         MarkdownMessage(
                             text = message.body,
                             modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp),
+                            onOpenRemoteFile = { onOpenRemoteFile(it, false) },
                         )
                     }
                 }
@@ -1212,6 +1254,9 @@ private fun MessageBubble(
                         ThinkingBlock(
                             activities = activities,
                             groupKey = message.id,
+                            onOpenRemoteFile = onOpenRemoteFile,
+                            onLoadRemoteFile = onLoadRemoteFile,
+                            onShowRemoteFile = onShowRemoteFile,
                         )
                         if (message.body.isNotBlank()) Spacer(Modifier.height(10.dp))
                     }
@@ -1219,6 +1264,7 @@ private fun MessageBubble(
                         MarkdownMessage(
                             text = message.body,
                             modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp),
+                            onOpenRemoteFile = { onOpenRemoteFile(it, false) },
                         )
                     }
                 }
@@ -1304,6 +1350,9 @@ private fun ThinkingBlock(
     activities: List<ToolActivity>,
     groupKey: String,
     modifier: Modifier = Modifier,
+    onOpenRemoteFile: (String, Boolean) -> Unit,
+    onLoadRemoteFile: suspend (String, Boolean) -> RemoteResult<DownloadedRemoteFile>,
+    onShowRemoteFile: (DownloadedRemoteFile) -> Unit,
 ) {
     val active = activities.any { it.state == ToolActivityState.RUNNING }
     val failed = activities.any { it.state == ToolActivityState.FAILED }
@@ -1383,7 +1432,12 @@ private fun ThinkingBlock(
                     contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 4.dp),
                 ) {
                     itemsIndexed(activities, key = { _, activity -> activity.id }) { index, activity ->
-                        ThinkingActivityRow(activity)
+                        ThinkingActivityRow(
+                            activity = activity,
+                            onOpenRemoteFile = onOpenRemoteFile,
+                            onLoadRemoteFile = onLoadRemoteFile,
+                            onShowRemoteFile = onShowRemoteFile,
+                        )
                         if (index != activities.lastIndex) HorizontalDivider(Modifier.padding(start = 26.dp))
                     }
                 }
@@ -1393,8 +1447,26 @@ private fun ThinkingBlock(
 }
 
 @Composable
-private fun ThinkingActivityRow(activity: ToolActivity) {
+private fun ThinkingActivityRow(
+    activity: ToolActivity,
+    onOpenRemoteFile: (String, Boolean) -> Unit,
+    onLoadRemoteFile: suspend (String, Boolean) -> RemoteResult<DownloadedRemoteFile>,
+    onShowRemoteFile: (DownloadedRemoteFile) -> Unit,
+) {
     val running = activity.state == ToolActivityState.RUNNING
+    val remoteReference = remember(activity.title, activity.detail) {
+        remoteFileReferenceFromActivity(activity.title, activity.detail)
+    }
+    val downloaded by produceState<RemoteResult<DownloadedRemoteFile>?>(
+        initialValue = null,
+        activity.id,
+        activity.updatedAt,
+        remoteReference,
+    ) {
+        if (remoteReference != null && !running) {
+            value = onLoadRemoteFile(remoteReference, true)
+        }
+    }
     Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.Top) {
         if (running) {
             CircularProgressIndicator(Modifier.size(14.dp), strokeWidth = 1.8.dp)
@@ -1416,8 +1488,237 @@ private fun ThinkingActivityRow(activity: ToolActivity) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
+            when (val result = downloaded) {
+                null -> if (remoteReference != null && !running) {
+                    Row(
+                        modifier = Modifier.padding(top = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        CircularProgressIndicator(Modifier.size(13.dp), strokeWidth = 1.6.dp)
+                        Spacer(Modifier.width(7.dp))
+                        Text("Loading file…", style = MaterialTheme.typography.labelSmall)
+                    }
+                }
+                is RemoteResult.Success -> {
+                    if (result.value.isImage) {
+                        RemoteImagePreview(result.value, onShowRemoteFile)
+                    } else {
+                        TextButton(onClick = { onShowRemoteFile(result.value) }) { Text("Open file") }
+                    }
+                }
+                is RemoteResult.Error -> if (remoteReference != null) {
+                    TextButton(onClick = { onOpenRemoteFile(remoteReference, true) }) { Text("Open file") }
+                }
+            }
         }
     }
+}
+
+@Composable
+private fun RemoteImagePreview(
+    file: DownloadedRemoteFile,
+    onOpen: (DownloadedRemoteFile) -> Unit,
+) {
+    val preview by produceState<ImageBitmap?>(null, file.localPath) {
+        value = withContext(Dispatchers.IO) { decodeFilePreview(file.localPath) }
+    }
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 100.dp, max = 240.dp)
+            .padding(top = 7.dp)
+            .clickable { onOpen(file) },
+        shape = RoundedCornerShape(10.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant,
+    ) {
+        if (preview != null) {
+            Image(
+                bitmap = checkNotNull(preview),
+                contentDescription = "Open ${file.displayName}",
+                modifier = Modifier.fillMaxWidth(),
+                contentScale = ContentScale.Fit,
+            )
+        } else {
+            Box(Modifier.fillMaxWidth().height(100.dp), contentAlignment = Alignment.Center) {
+                Text("Open ${file.displayName}", style = MaterialTheme.typography.labelMedium)
+            }
+        }
+    }
+}
+
+@Composable
+private fun RemoteFileViewerDialog(
+    state: RemoteFileViewerState,
+    onDismiss: () -> Unit,
+) {
+    val context = LocalContext.current
+    val file = state.file
+    var openError by remember(file?.localPath) { mutableStateOf<String?>(null) }
+    val image by produceState<ImageBitmap?>(null, file?.localPath, file?.isImage) {
+        value = if (file?.isImage == true) {
+            withContext(Dispatchers.IO) { decodeFilePreview(file.localPath) }
+        } else {
+            null
+        }
+    }
+    val textPreview by produceState<TextFilePreview?>(null, file?.localPath, file?.isText) {
+        value = if (file?.isText == true) {
+            withContext(Dispatchers.IO) { readTextFilePreview(file.localPath) }
+        } else {
+            null
+        }
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text(
+                when {
+                    state.loadingReference != null -> "Downloading file"
+                    file != null -> file.displayName
+                    else -> "Could not open file"
+                },
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        },
+        text = {
+            Column(Modifier.fillMaxWidth()) {
+                when {
+                    state.loadingReference != null -> {
+                        val total = state.totalBytes
+                        val fraction = total
+                            ?.takeIf { it > 0 }
+                            ?.let { (state.bytesDownloaded.toFloat() / it).coerceIn(0f, 1f) }
+                        if (fraction != null) {
+                            LinearProgressIndicator(
+                                progress = { fraction },
+                                modifier = Modifier.fillMaxWidth(),
+                            )
+                        } else {
+                            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                        }
+                        Spacer(Modifier.height(10.dp))
+                        Text(
+                            buildString {
+                                append(formatFileSize(state.bytesDownloaded))
+                                if (total != null) {
+                                    append(" of ")
+                                    append(formatFileSize(total))
+                                    append(" · ")
+                                    append(((state.bytesDownloaded * 100) / total.coerceAtLeast(1)).coerceIn(0, 100))
+                                    append('%')
+                                }
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Text(
+                            state.loadingReference,
+                            modifier = Modifier.padding(top = 6.dp),
+                            maxLines = 3,
+                            overflow = TextOverflow.Ellipsis,
+                            style = MaterialTheme.typography.labelSmall,
+                        )
+                    }
+                    state.error != null -> Text(state.error)
+                    file != null && file.isImage -> {
+                        if (image != null) {
+                            Image(
+                                bitmap = checkNotNull(image),
+                                contentDescription = file.displayName,
+                                modifier = Modifier.fillMaxWidth().heightIn(max = 520.dp),
+                                contentScale = ContentScale.Fit,
+                            )
+                        } else {
+                            Text("This image format cannot be previewed here. You can open it in another app.")
+                        }
+                    }
+                    file != null && file.isText -> {
+                        val preview = textPreview
+                        if (preview == null) {
+                            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                        } else {
+                            SelectionContainer {
+                                Text(
+                                    preview.content + if (preview.truncated) "\n\n… Preview truncated" else "",
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .heightIn(max = 520.dp)
+                                        .verticalScroll(rememberScrollState())
+                                        .horizontalScroll(rememberScrollState()),
+                                    fontFamily = FontFamily.Monospace,
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                        }
+                    }
+                    file != null -> Text(
+                        "${file.mimeType}\n${formatFileSize(file.sizeBytes)}\n\nUse another app to view this file.",
+                    )
+                }
+                if (file != null) {
+                    Text(
+                        file.remotePath,
+                        modifier = Modifier.padding(top = 10.dp),
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                openError?.let {
+                    Text(it, modifier = Modifier.padding(top = 8.dp), color = RelayRed)
+                }
+            }
+        },
+        confirmButton = {
+            if (file != null) {
+                TextButton(
+                    onClick = {
+                        openError = launchDownloadedFile(context, file).fold(
+                            onSuccess = { null },
+                            onFailure = { it.message ?: "No app can open this file" },
+                        )
+                    },
+                ) { Text("Open in another app") }
+            }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+    )
+}
+
+private data class TextFilePreview(val content: String, val truncated: Boolean)
+
+private fun readTextFilePreview(path: String): TextFilePreview {
+    val output = StringBuilder()
+    var truncated = false
+    File(path).bufferedReader().use { reader ->
+        val buffer = CharArray(8 * 1024)
+        while (output.length < MAX_TEXT_PREVIEW_CHARS) {
+            val count = reader.read(buffer, 0, minOf(buffer.size, MAX_TEXT_PREVIEW_CHARS - output.length))
+            if (count < 0) return@use
+            output.append(buffer, 0, count)
+        }
+        truncated = reader.read() >= 0
+    }
+    return TextFilePreview(output.toString(), truncated)
+}
+
+private fun launchDownloadedFile(context: Context, file: DownloadedRemoteFile): Result<Unit> = runCatching {
+    val localFile = File(file.localPath)
+    require(localFile.isFile) { "The cached file is no longer available" }
+    val uri = FileProvider.getUriForFile(context, "${context.packageName}.files", localFile)
+    val intent = Intent(Intent.ACTION_VIEW)
+        .setDataAndType(uri, file.mimeType)
+        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    context.startActivity(Intent.createChooser(intent, "Open ${file.displayName}"))
+}
+
+private fun formatFileSize(bytes: Long): String = when {
+    bytes < 1024 -> "$bytes B"
+    bytes < 1024L * 1024L -> "%.1f KB".format(bytes / 1024.0)
+    bytes < 1024L * 1024L * 1024L -> "%.1f MB".format(bytes / (1024.0 * 1024.0))
+    else -> "%.1f GB".format(bytes / (1024.0 * 1024.0 * 1024.0))
 }
 
 @Composable
@@ -2306,3 +2607,5 @@ private fun String.isValidRoutePattern(): Boolean {
 private fun TunnelRouteRule.displayName(): String = hostPattern + (port?.let { ":$it" } ?: " · any port")
 
 private fun TunnelRouteRule.displayNameForEditor(): String = hostPattern + (port?.let { ":$it" } ?: "")
+
+private const val MAX_TEXT_PREVIEW_CHARS = 500_000

@@ -21,11 +21,13 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.LinkAnnotation
+import androidx.compose.ui.text.LinkInteractionListener
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.TextLinkStyles
 import androidx.compose.ui.text.buildAnnotatedString
@@ -35,6 +37,7 @@ import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.puppycoder.relay.data.isRemoteFileReference
 
 internal sealed interface MarkdownBlock {
     data class Paragraph(val text: String) : MarkdownBlock
@@ -64,14 +67,18 @@ private val anyUnorderedItemStart = Regex("^\\s*[-+*]\\s+")
 private val anyOrderedItemStart = Regex("^\\s*\\d+\\.\\s+")
 
 @Composable
-internal fun MarkdownMessage(text: String, modifier: Modifier = Modifier) {
+internal fun MarkdownMessage(
+    text: String,
+    modifier: Modifier = Modifier,
+    onOpenRemoteFile: (String) -> Unit = {},
+) {
     val blocks = remember(text) { parseMarkdownBlocks(text) }
     val linkColor = MaterialTheme.colorScheme.primary
 
     Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(7.dp)) {
         blocks.forEach { block ->
             when (block) {
-                is MarkdownBlock.Paragraph -> MarkdownText(block.text, linkColor)
+                is MarkdownBlock.Paragraph -> MarkdownText(block.text, linkColor, onOpenRemoteFile = onOpenRemoteFile)
                 is MarkdownBlock.Heading -> MarkdownText(
                     text = block.text,
                     linkColor = linkColor,
@@ -82,6 +89,7 @@ internal fun MarkdownMessage(text: String, modifier: Modifier = Modifier) {
                         3 -> 18
                         else -> 16
                     },
+                    onOpenRemoteFile = onOpenRemoteFile,
                 )
                 is MarkdownBlock.Quote -> Row(verticalAlignment = Alignment.Top) {
                     Box(
@@ -96,14 +104,15 @@ internal fun MarkdownMessage(text: String, modifier: Modifier = Modifier) {
                         linkColor = linkColor,
                         modifier = Modifier.weight(1f),
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        onOpenRemoteFile = onOpenRemoteFile,
                     )
                 }
                 is MarkdownBlock.ListItem -> Row(verticalAlignment = Alignment.Top) {
                     Text(block.marker, modifier = Modifier.width(25.dp), fontWeight = FontWeight.SemiBold)
-                    MarkdownText(block.text, linkColor, Modifier.weight(1f))
+                    MarkdownText(block.text, linkColor, Modifier.weight(1f), onOpenRemoteFile = onOpenRemoteFile)
                 }
                 is MarkdownBlock.Code -> CodeBlock(block)
-                is MarkdownBlock.Table -> MarkdownTable(block, linkColor)
+                is MarkdownBlock.Table -> MarkdownTable(block, linkColor, onOpenRemoteFile)
             }
         }
     }
@@ -118,8 +127,16 @@ private fun MarkdownText(
     fontWeight: FontWeight? = null,
     fontSize: Int = 15,
     textAlign: TextAlign? = null,
+    onOpenRemoteFile: (String) -> Unit = {},
 ) {
-    val formatted = remember(text, linkColor) { inlineMarkdown(text, linkColor) }
+    val uriHandler = LocalUriHandler.current
+    val linkListener = remember(uriHandler, onOpenRemoteFile) {
+        LinkInteractionListener { annotation ->
+            val url = (annotation as? LinkAnnotation.Url)?.url ?: return@LinkInteractionListener
+            if (isRemoteFileReference(url)) onOpenRemoteFile(url) else uriHandler.openUri(url)
+        }
+    }
+    val formatted = remember(text, linkColor, linkListener) { inlineMarkdown(text, linkColor, linkListener) }
     SelectionContainer(modifier = modifier) {
         Text(
             text = formatted,
@@ -133,7 +150,11 @@ private fun MarkdownText(
 }
 
 @Composable
-private fun MarkdownTable(block: MarkdownBlock.Table, linkColor: Color) {
+private fun MarkdownTable(
+    block: MarkdownBlock.Table,
+    linkColor: Color,
+    onOpenRemoteFile: (String) -> Unit,
+) {
     val columnWidths = remember(block) {
         block.headers.indices.map { column ->
             val longest = sequenceOf(block.headers[column])
@@ -149,10 +170,24 @@ private fun MarkdownTable(block: MarkdownBlock.Table, linkColor: Color) {
         color = MaterialTheme.colorScheme.surface.copy(alpha = .45f),
     ) {
         Column(Modifier.horizontalScroll(rememberScrollState())) {
-            MarkdownTableRow(block.headers, block.alignments, columnWidths, linkColor, header = true)
+            MarkdownTableRow(
+                block.headers,
+                block.alignments,
+                columnWidths,
+                linkColor,
+                header = true,
+                onOpenRemoteFile = onOpenRemoteFile,
+            )
             HorizontalDivider()
             block.rows.forEachIndexed { index, row ->
-                MarkdownTableRow(row, block.alignments, columnWidths, linkColor, header = false)
+                MarkdownTableRow(
+                    row,
+                    block.alignments,
+                    columnWidths,
+                    linkColor,
+                    header = false,
+                    onOpenRemoteFile = onOpenRemoteFile,
+                )
                 if (index != block.rows.lastIndex) HorizontalDivider()
             }
         }
@@ -166,6 +201,7 @@ private fun MarkdownTableRow(
     columnWidths: List<androidx.compose.ui.unit.Dp>,
     linkColor: Color,
     header: Boolean,
+    onOpenRemoteFile: (String) -> Unit,
 ) {
     Row {
         columnWidths.indices.forEach { column ->
@@ -183,6 +219,7 @@ private fun MarkdownTableRow(
                     MarkdownTableAlignment.CENTER -> TextAlign.Center
                     MarkdownTableAlignment.END -> TextAlign.End
                 },
+                onOpenRemoteFile = onOpenRemoteFile,
             )
         }
     }
@@ -354,7 +391,11 @@ private fun startsMarkdownBlock(line: String): Boolean =
         anyUnorderedItemStart.containsMatchIn(line) ||
         anyOrderedItemStart.containsMatchIn(line)
 
-private fun inlineMarkdown(source: String, linkColor: Color): AnnotatedString = buildAnnotatedString {
+private fun inlineMarkdown(
+    source: String,
+    linkColor: Color,
+    linkInteractionListener: LinkInteractionListener,
+): AnnotatedString = buildAnnotatedString {
     fun appendRange(value: String) {
         var index = 0
         while (index < value.length) {
@@ -411,6 +452,7 @@ private fun inlineMarkdown(source: String, linkColor: Color): AnnotatedString = 
                                         textDecoration = TextDecoration.Underline,
                                     ),
                                 ),
+                                linkInteractionListener,
                             ),
                         )
                         append(value.substring(index + 1, labelEnd))

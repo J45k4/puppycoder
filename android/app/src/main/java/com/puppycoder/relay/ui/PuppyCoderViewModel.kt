@@ -11,8 +11,10 @@ import com.puppycoder.relay.data.ConnectionState
 import com.puppycoder.relay.data.Conversation
 import com.puppycoder.relay.data.ConversationState
 import com.puppycoder.relay.data.DiscoveredAgentServer
+import com.puppycoder.relay.data.DownloadedRemoteFile
 import com.puppycoder.relay.data.RelayServer
 import com.puppycoder.relay.data.RemoteResult
+import com.puppycoder.relay.data.RemoteFileProgress
 import com.puppycoder.relay.data.SshTunnelProfile
 import com.puppycoder.relay.data.ToolActivity
 import com.puppycoder.relay.data.TunnelRouteRule
@@ -47,6 +49,8 @@ class PuppyCoderViewModel(application: Application) : AndroidViewModel(applicati
     private val _historyPaging = MutableStateFlow(HistoryPagingState())
     private val _chatSearchQuery = MutableStateFlow("")
     private val _serverDiscovery = MutableStateFlow(ServerDiscoveryState())
+    private val _remoteFileViewer = MutableStateFlow(RemoteFileViewerState())
+    private val remoteFilePreviewCache = mutableMapOf<String, DownloadedRemoteFile>()
     private val _chatSortOrder = MutableStateFlow(
         runCatching {
             ChatSortOrder.valueOf(chatListPreferences.getString("sort_order", null).orEmpty())
@@ -67,6 +71,7 @@ class PuppyCoderViewModel(application: Application) : AndroidViewModel(applicati
     private var conversationTrackingGeneration = 0L
     private var trackedConversationId: String? = null
     private var liveHistoryRefreshJob: Job? = null
+    private var remoteFileDownloadJob: Job? = null
     private var liveHistoryRefreshPending = false
     private var chatScrollInProgress = false
     private var chatViewportAtLatest = true
@@ -78,6 +83,7 @@ class PuppyCoderViewModel(application: Application) : AndroidViewModel(applicati
     val historyPaging: StateFlow<HistoryPagingState> = _historyPaging
     val chatSearchQuery: StateFlow<String> = _chatSearchQuery
     val serverDiscovery: StateFlow<ServerDiscoveryState> = _serverDiscovery
+    val remoteFileViewer: StateFlow<RemoteFileViewerState> = _remoteFileViewer
     val chatSortOrder: StateFlow<ChatSortOrder> = _chatSortOrder
     val chatGroupMode: StateFlow<ChatGroupMode> = _chatGroupMode
     val collapsedChatGroups: StateFlow<Set<String>> = _collapsedChatGroups
@@ -434,6 +440,60 @@ class PuppyCoderViewModel(application: Application) : AndroidViewModel(applicati
         }
     }
 
+    fun openRemoteFile(reference: String, allowOutsideWorkspace: Boolean = false) {
+        val conversationId = selectedChatId.value ?: return
+        remoteFileDownloadJob?.cancel()
+        _remoteFileViewer.value = RemoteFileViewerState(loadingReference = reference)
+        remoteFileDownloadJob = viewModelScope.launch {
+            when (
+                val result = repository.downloadRemoteFile(
+                    conversationId,
+                    reference,
+                    allowOutsideWorkspace,
+                ) { progress ->
+                    if (_remoteFileViewer.value.loadingReference == reference) {
+                        _remoteFileViewer.value = _remoteFileViewer.value.copy(
+                            bytesDownloaded = progress.bytesDownloaded,
+                            totalBytes = progress.totalBytes,
+                        )
+                    }
+                }
+            ) {
+                is RemoteResult.Success -> {
+                    remoteFilePreviewCache["$conversationId:$reference:$allowOutsideWorkspace"] = result.value
+                    _remoteFileViewer.value = RemoteFileViewerState(file = result.value)
+                }
+                is RemoteResult.Error -> _remoteFileViewer.value = RemoteFileViewerState(error = result.message)
+            }
+        }
+    }
+
+    suspend fun loadRemoteFile(
+        conversationId: String,
+        reference: String,
+        allowOutsideWorkspace: Boolean,
+        onProgress: (RemoteFileProgress) -> Unit = {},
+    ): RemoteResult<DownloadedRemoteFile> {
+        val cacheKey = "$conversationId:$reference:$allowOutsideWorkspace"
+        remoteFilePreviewCache[cacheKey]?.takeIf { java.io.File(it.localPath).isFile }?.let {
+            return RemoteResult.Success(it)
+        }
+        return repository.downloadRemoteFile(conversationId, reference, allowOutsideWorkspace, onProgress).also { result ->
+            if (result is RemoteResult.Success) remoteFilePreviewCache[cacheKey] = result.value
+        }
+    }
+
+    fun showRemoteFile(file: DownloadedRemoteFile) {
+        remoteFileDownloadJob?.cancel()
+        _remoteFileViewer.value = RemoteFileViewerState(file = file)
+    }
+
+    fun closeRemoteFile() {
+        remoteFileDownloadJob?.cancel()
+        remoteFileDownloadJob = null
+        _remoteFileViewer.value = RemoteFileViewerState()
+    }
+
     fun retryMessage(id: String) {
         viewModelScope.launch { repository.retryMessage(id) }
     }
@@ -647,6 +707,14 @@ data class ServerDiscoveryState(
     val loading: Boolean = false,
     val results: List<DiscoveredAgentServer> = emptyList(),
     val addedCount: Int = 0,
+    val error: String? = null,
+)
+
+data class RemoteFileViewerState(
+    val loadingReference: String? = null,
+    val bytesDownloaded: Long = 0,
+    val totalBytes: Long? = null,
+    val file: DownloadedRemoteFile? = null,
     val error: String? = null,
 )
 

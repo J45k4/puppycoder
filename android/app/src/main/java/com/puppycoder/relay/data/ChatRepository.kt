@@ -37,6 +37,7 @@ class ChatRepository(
     private val historySyncCache = ConcurrentHashMap<String, CachedHistorySync>()
     private val remoteSyncMutex = Mutex()
     private val imageStore = MessageImageStore(context)
+    private val remoteFileCache = RemoteFileCache(context)
 
     val computers: Flow<List<RelayServer>> = dao.observeComputers().map { entities ->
         entities.map { it.toModel(secretStore) }
@@ -252,6 +253,41 @@ class ChatRepository(
 
     fun tools(conversationId: String): Flow<List<ToolActivity>> =
         dao.observeTools(conversationId).map { list -> list.map(ToolActivityEntity::toModel) }
+
+    suspend fun downloadRemoteFile(
+        conversationId: String,
+        reference: String,
+        allowOutsideWorkspace: Boolean = false,
+        onProgress: (RemoteFileProgress) -> Unit = {},
+    ): RemoteResult<DownloadedRemoteFile> {
+        val conversation = dao.getConversation(conversationId)
+            ?: return RemoteResult.Error("Chat not found")
+        val computer = dao.getComputer(conversation.computerId)?.toModel(secretStore)
+            ?: return RemoteResult.Error("Computer not found")
+        val remotePath = resolveRemoteFileReference(
+            workspace = conversation.workspace,
+            reference = reference,
+            allowOutsideWorkspace = allowOutsideWorkspace,
+        ) ?: return RemoteResult.Error("File link is invalid or points outside the chat workspace")
+        return withContext(Dispatchers.IO) {
+            val target = remoteFileCache.createTarget(computer.id, remotePath)
+            val maxBytes = remoteFileCache.maxDownloadBytes()
+            if (maxBytes <= 0) return@withContext RemoteResult.Error("Not enough free space to cache remote file")
+            try {
+                val result = target.temporary.outputStream().buffered().use { output ->
+                    client.downloadFile(computer, remotePath, output, maxBytes, onProgress)
+                }
+                when (result) {
+                    is RemoteResult.Error -> result
+                    is RemoteResult.Success -> RemoteResult.Success(
+                        remoteFileCache.complete(target, result.value.sizeBytes),
+                    )
+                }
+            } finally {
+                remoteFileCache.discard(target)
+            }
+        }
+    }
 
     suspend fun oldestStoredMessageAt(conversationId: String): Long? = dao.oldestMessageAt(conversationId)
 

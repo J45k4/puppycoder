@@ -1,6 +1,7 @@
 package com.puppycoder.relay.data
 
 import java.io.Closeable
+import java.io.OutputStream
 import java.util.UUID
 
 enum class ConversationState {
@@ -83,6 +84,35 @@ data class MessageImage(
     val width: Int,
     val height: Int,
     val createdAt: Long = System.currentTimeMillis(),
+)
+
+data class RemoteFileDownload(
+    val remotePath: String,
+    val sizeBytes: Long,
+)
+
+data class RemoteFileProgress(
+    val bytesDownloaded: Long,
+    val totalBytes: Long?,
+)
+
+data class DownloadedRemoteFile(
+    val remotePath: String,
+    val localPath: String,
+    val displayName: String,
+    val mimeType: String,
+    val sizeBytes: Long,
+) {
+    val isImage: Boolean get() = mimeType.startsWith("image/")
+    val isText: Boolean get() = mimeType.startsWith("text/") || mimeType in TEXT_MIME_TYPES
+}
+
+private val TEXT_MIME_TYPES = setOf(
+    "application/json",
+    "application/xml",
+    "application/javascript",
+    "application/x-sh",
+    "application/x-yaml",
 )
 
 data class ToolActivity(
@@ -202,6 +232,13 @@ interface AgentConversationClient {
         remoteConversationId: String,
         onChanged: () -> Unit,
     ): RemoteResult<Closeable?>
+    suspend fun downloadFile(
+        computer: RelayServer,
+        remotePath: String,
+        output: OutputStream,
+        maxBytes: Long,
+        onProgress: (RemoteFileProgress) -> Unit,
+    ): RemoteResult<RemoteFileDownload>
     suspend fun testTunnel(
         profile: SshTunnelProfile,
         computerEndpoints: List<String>,

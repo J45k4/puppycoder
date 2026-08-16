@@ -4,8 +4,10 @@ import com.jcraft.jsch.HostKey
 import com.jcraft.jsch.HostKeyRepository
 import com.jcraft.jsch.JSch
 import com.jcraft.jsch.ChannelDirectTCPIP
+import com.jcraft.jsch.ChannelSftp
 import com.jcraft.jsch.Session
 import com.jcraft.jsch.UserInfo
+import java.io.OutputStream
 import java.net.URI
 import java.security.MessageDigest
 import java.util.Base64
@@ -81,6 +83,79 @@ internal class SshTunnelManager {
                     (error.message ?: "connection failed"),
                 error,
             )
+        } finally {
+            channel.disconnect()
+        }
+    }
+
+    fun readFile(
+        server: RelayServer,
+        profiles: List<SshTunnelProfile>,
+        remotePath: String,
+        output: OutputStream,
+        maxBytes: Long,
+        onProgress: (RemoteFileProgress) -> Unit,
+    ): RemoteFileDownload {
+        require(remotePath.startsWith('/')) { "Remote file path must be absolute" }
+        require('\u0000' !in remotePath) { "Remote file path is invalid" }
+        val target = parseTunnelTarget(server.endpoint)
+        val candidates = selectTunnelProfiles(server, profiles, target)
+        require(candidates.isNotEmpty()) {
+            "Remote file viewing requires an SSH tunnel matching ${target.host}:${target.port}"
+        }
+        val failures = mutableListOf<String>()
+        candidates.forEach { profile ->
+            val session = synchronized(this) { gatewayFor(profile).session }
+            var transferStarted = false
+            val result = runCatching {
+                readFile(session, remotePath, output, maxBytes) { progress ->
+                    if (progress.bytesDownloaded > 0) transferStarted = true
+                    onProgress(progress)
+                }
+            }
+            result.onSuccess { return it }
+            val failure = result.exceptionOrNull()
+            failures += "${profile.name}: ${failure?.message ?: "download failed"}"
+            if (transferStarted) error("Remote file download was interrupted. ${failures.last()}")
+        }
+        error("Could not download remote file. ${failures.joinToString("; ")}")
+    }
+
+    private fun readFile(
+        session: Session,
+        remotePath: String,
+        output: OutputStream,
+        maxBytes: Long,
+        onProgress: (RemoteFileProgress) -> Unit,
+    ): RemoteFileDownload {
+        val channel = session.openChannel("sftp") as ChannelSftp
+        try {
+            channel.connect(CONNECT_TIMEOUT_MS)
+            val attributes = channel.lstat(remotePath)
+            require(!attributes.isDir) { "Remote path is a directory" }
+            require(attributes.size <= maxBytes) {
+                "Remote file is too large (${attributes.size} bytes; limit is $maxBytes bytes)"
+            }
+            onProgress(RemoteFileProgress(0, attributes.size))
+            channel.get(remotePath).use { input ->
+                val buffer = ByteArray(32 * 1024)
+                var total = 0L
+                var lastReported = 0L
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read < 0) break
+                    total += read
+                    require(total <= maxBytes) { "Remote file exceeded the $maxBytes byte limit" }
+                    output.write(buffer, 0, read)
+                    if (total == attributes.size || total - lastReported >= PROGRESS_REPORT_BYTES) {
+                        onProgress(RemoteFileProgress(total, attributes.size))
+                        lastReported = total
+                    }
+                }
+                if (lastReported != total) onProgress(RemoteFileProgress(total, attributes.size))
+            }
+            output.flush()
+            return RemoteFileDownload(remotePath, attributes.size)
         } finally {
             channel.disconnect()
         }
@@ -164,6 +239,7 @@ internal class SshTunnelManager {
     private companion object {
         const val CONNECT_TIMEOUT_MS = 8_000
         const val LOOPBACK = "127.0.0.1"
+        const val PROGRESS_REPORT_BYTES = 256L * 1024L
     }
 }
 
