@@ -43,8 +43,38 @@ class ChatRepository(
         entities.map { it.toModel(secretStore) }
     }
 
-    val tunnels: Flow<List<SshTunnelProfile>> = dao.observeTunnels().map { tunnels ->
-        tunnels.map { it.toModel(secretStore) }
+    val identities: Flow<List<SshIdentity>> = dao.observeIdentities().map { identities ->
+        identities.map { it.toModel(secretStore) }
+    }
+
+    val sshConnections: Flow<List<SshConnection>> = combine(
+        dao.observeSshConnections(),
+        dao.observeIdentities(),
+    ) { connectionRows, identityRows ->
+        val identities = identityRows.map { it.toModel(secretStore) }
+        connectionRows.map { it.toModel(secretStore).withIdentityNames(identities) }
+    }
+
+    val tunnels: Flow<List<SshTunnelProfile>> = combine(
+        dao.observeTunnels(),
+        dao.observeIdentities(),
+        dao.observeSshConnections(),
+    ) { tunnelRows, identityRows, connectionRows ->
+        val identities = identityRows.map { it.toModel(secretStore) }
+        val connections = connectionRows.map { it.toModel(secretStore) }
+        tunnelRows.map {
+            it.toModel(secretStore).withConnections(connections).withIdentityNames(identities)
+        }
+    }
+
+    private val resolvedTunnels: Flow<List<SshTunnelProfile>> = combine(
+        dao.observeTunnels(),
+        dao.observeIdentities(),
+        dao.observeSshConnections(),
+    ) { tunnelRows, identityRows, connectionRows ->
+        val identities = identityRows.map { it.toModel(secretStore) }
+        val connections = connectionRows.map { it.toModel(secretStore) }
+        tunnelRows.map { it.toModel(secretStore).withConnections(connections).resolved(identities) }
     }
 
     val chats: Flow<List<ChatListItem>> = chatListItems(dao.observeConversations())
@@ -66,12 +96,28 @@ class ChatRepository(
     }
 
     suspend fun initialize() {
-        client.setTunnelProfiles(dao.getTunnels().map { it.toModel(secretStore) })
-        scope.launch { tunnels.collect(client::setTunnelProfiles) }
+        client.setTunnelProfiles(resolveTunnels())
+        scope.launch { resolvedTunnels.collect(client::setTunnelProfiles) }
         val now = System.currentTimeMillis()
         dao.recoverSendingMessages(now)
         dao.recoverStreamingMessages(now)
         dao.conversationsWithQueuedMessages().forEach(::scheduleOutbox)
+    }
+
+    private suspend fun resolveTunnels(): List<SshTunnelProfile> {
+        val identities = dao.getIdentities().map { it.toModel(secretStore) }
+        val connections = dao.getSshConnections().map { it.toModel(secretStore) }
+        return dao.getTunnels().map { it.toModel(secretStore).withConnections(connections).resolved(identities) }
+    }
+
+    private suspend fun resolvedProfile(id: String): SshTunnelProfile? {
+        val identities = dao.getIdentities().map { it.toModel(secretStore) }
+        val connections = dao.getSshConnections().map { it.toModel(secretStore) }
+        return dao.getTunnels()
+            .firstOrNull { it.profile.id == id }
+            ?.toModel(secretStore)
+            ?.withConnections(connections)
+            ?.resolved(identities)
     }
 
     suspend fun syncRemoteChats(): RemoteChatSyncReport = remoteSyncMutex.withLock {
@@ -303,6 +349,15 @@ class ChatRepository(
         return client.subscribeConversation(computer, remoteId, onChanged)
     }
 
+    suspend fun forceClaimConversation(conversationId: String): RemoteResult<Unit> {
+        val conversation = dao.getConversation(conversationId)
+            ?: return RemoteResult.Error("Chat not found")
+        val remoteId = conversation.remoteConversationId ?: return RemoteResult.Error("This chat is not connected to Codex")
+        val computer = dao.getComputer(conversation.computerId)?.toModel(secretStore)
+            ?: return RemoteResult.Error("Computer not found")
+        return client.forceClaimConversation(computer, remoteId)
+    }
+
     suspend fun saveComputer(computer: RelayServer) {
         dao.upsertComputer(computer.toEntity(secretStore))
     }
@@ -311,10 +366,38 @@ class ChatRepository(
 
     suspend fun saveTunnel(profile: SshTunnelProfile) {
         val replacingExisting = dao.getTunnels().any { it.profile.id == profile.id }
-        val (entity, routes) = profile.toEntities(secretStore)
-        dao.upsertTunnel(entity, routes)
+        val (entity, hops, routes) = profile.toEntities(secretStore)
+        dao.upsertTunnel(entity, hops, routes)
         if (replacingExisting) client.closeTunnelProfile(profile.id)
-        client.setTunnelProfiles(dao.getTunnels().map { it.toModel(secretStore) })
+        client.setTunnelProfiles(resolveTunnels())
+    }
+
+    suspend fun saveIdentity(identity: SshIdentity) {
+        dao.upsertIdentity(identity.toEntity(secretStore))
+        client.setTunnelProfiles(resolveTunnels())
+    }
+
+    suspend fun deleteIdentity(id: String): Result<Unit> = runCatching {
+        val useCount = dao.connectionsUsingIdentity(id) + dao.hopsUsingIdentity(id)
+        require(useCount == 0) {
+            "This identity is used by $useCount SSH connection${if (useCount == 1) "" else "s"}. Detach it first."
+        }
+        dao.deleteIdentity(id)
+        client.setTunnelProfiles(resolveTunnels())
+    }
+
+    suspend fun saveSshConnection(connection: SshConnection) {
+        dao.upsertSshConnection(connection.toEntity(secretStore))
+        client.setTunnelProfiles(resolveTunnels())
+    }
+
+    suspend fun deleteSshConnection(id: String): Result<Unit> = runCatching {
+        val hopCount = dao.hopsUsingSshConnection(id)
+        require(hopCount == 0) {
+            "This SSH connection is used by $hopCount tunnel hop${if (hopCount == 1) "" else "s"}."
+        }
+        dao.deleteSshConnection(id)
+        client.setTunnelProfiles(resolveTunnels())
     }
 
     suspend fun addTunnelRoute(id: String, route: TunnelRouteRule) {
@@ -339,14 +422,29 @@ class ChatRepository(
     }
 
     suspend fun testTunnel(id: String): RemoteResult<SshTunnelTest> {
-        val profile = dao.getTunnels().firstOrNull { it.profile.id == id }?.toModel(secretStore)
+        val profile = resolvedProfile(id)
             ?: return RemoteResult.Error("SSH tunnel not found")
         val endpoints = dao.getComputers().map(ComputerEntity::endpoint)
         return client.testTunnel(profile, endpoints)
     }
 
+    suspend fun testSshConnection(id: String): RemoteResult<SshTunnelTest> {
+        val identities = dao.getIdentities().map { it.toModel(secretStore) }
+        val connection = dao.getSshConnections()
+            .firstOrNull { it.id == id }
+            ?.toModel(secretStore)
+            ?: return RemoteResult.Error("SSH connection not found")
+        val profile = SshTunnelProfile(
+            id = "connection-test-$id",
+            name = connection.name,
+            hops = listOf(connection.ssh),
+            routes = emptyList(),
+        ).resolved(identities)
+        return client.testTunnel(profile, emptyList())
+    }
+
     suspend fun discoverServers(id: String): RemoteResult<List<DiscoveredAgentServer>> {
-        val profile = dao.getTunnels().firstOrNull { it.profile.id == id }?.toModel(secretStore)
+        val profile = resolvedProfile(id)
             ?: return RemoteResult.Error("SSH tunnel not found")
         return client.discoverServers(profile)
     }

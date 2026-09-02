@@ -49,23 +49,47 @@ internal class SshTunnelManager {
 
     @Synchronized
     fun closeProfile(profileId: String) {
-        gateways.remove(profileId)?.session?.disconnect()
+        gateways.remove(profileId)?.sessions?.forEach(Session::disconnect)
     }
 
     @Synchronized
     fun test(profile: SshTunnelProfile, endpoints: List<String>): SshTunnelTest {
         val started = System.nanoTime()
-        val gateway = gatewayFor(profile)
+        val hopResults = mutableListOf<SshTunnelHopTest>()
+        val gateway = try {
+            gatewayFor(profile) { index, hop, latencyMs, error ->
+                hopResults += SshTunnelHopTest(
+                    hopIndex = index,
+                    label = hop.label(),
+                    latencyMs = latencyMs,
+                    ok = error == null,
+                    error = error,
+                )
+            }
+        } catch (failure: HopConnectionException) {
+            return SshTunnelTest(
+                message = failure.message ?: "SSH connection failed",
+                latencyMs = (System.nanoTime() - started) / 1_000_000,
+                hops = hopResults,
+            )
+        }
+        val hops = hopResults.ifEmpty {
+            gateway.hopLatencies.mapIndexed { index, latencyMs ->
+                SshTunnelHopTest(hopIndex = index, label = profile.hops[index].label(), latencyMs = latencyMs, ok = true)
+            }
+        }
+
         val target = findTunnelTestTarget(profile, endpoints)
 
         if (target == null) {
             return SshTunnelTest(
                 message = "SSH gateway connected; add a matching server or exact host and port to test forwarding",
                 latencyMs = (System.nanoTime() - started) / 1_000_000,
+                hops = hops,
             )
         }
 
-        val channel = gateway.session.openChannel("direct-tcpip") as ChannelDirectTCPIP
+        val channel = gateway.sessions.last().openChannel("direct-tcpip") as ChannelDirectTCPIP
         try {
             channel.setHost(target.host)
             channel.setPort(target.port)
@@ -76,6 +100,7 @@ internal class SshTunnelManager {
                 message = "SSH gateway and forwarded target are reachable",
                 latencyMs = (System.nanoTime() - started) / 1_000_000,
                 target = "${target.host}:${target.port}",
+                hops = hops,
             )
         } catch (error: Exception) {
             throw IllegalStateException(
@@ -105,7 +130,7 @@ internal class SshTunnelManager {
         }
         val failures = mutableListOf<String>()
         candidates.forEach { profile ->
-            val session = synchronized(this) { gatewayFor(profile).session }
+            val session = synchronized(this) { gatewayFor(profile).sessions.last() }
             var transferStarted = false
             val result = runCatching {
                 readFile(session, remotePath, output, maxBytes) { progress ->
@@ -163,7 +188,7 @@ internal class SshTunnelManager {
 
     @Synchronized
     fun close() {
-        gateways.values.forEach { it.session.disconnect() }
+        gateways.values.forEach { gateway -> gateway.sessions.forEach(Session::disconnect) }
         gateways.clear()
     }
 
@@ -175,64 +200,122 @@ internal class SshTunnelManager {
         val gateway = gatewayFor(profile)
 
         val localPort = gateway.forwards.getOrPut(target) {
-            gateway.session.setPortForwardingL(LOOPBACK, 0, target.host, target.port)
+            gateway.sessions.last().setPortForwardingL(LOOPBACK, 0, target.host, target.port)
         }
-        return ResolvedEndpoint(rewriteEndpoint(endpoint, localPort), "SSH · ${profile.name}")
+        val label = if (profile.hops.size == 1) {
+            "SSH · ${profile.name}"
+        } else {
+            "SSH · ${profile.name} · ${profile.hops.size} hops"
+        }
+        return ResolvedEndpoint(rewriteEndpoint(endpoint, localPort), label)
     }
 
-    private fun gatewayFor(profile: SshTunnelProfile): GatewayHandle {
-        val key = GatewayKey(profile.ssh)
+    private fun gatewayFor(
+        profile: SshTunnelProfile,
+        onHop: ((index: Int, hop: SshTunnelConfig, latencyMs: Long, error: String?) -> Unit)? = null,
+    ): GatewayHandle {
+        val key = GatewayKey(profile.hops)
         val current = gateways[profile.id]
-        if (current != null && current.key == key && current.session.isConnected) return current
+        if (current != null && current.key == key && current.sessions.last().isConnected) return current
 
-        current?.session?.disconnect()
-        return openGateway(profile, key).also { gateways[profile.id] = it }
+        current?.sessions?.forEach(Session::disconnect)
+        return openGateway(profile, key, onHop).also { gateways[profile.id] = it }
     }
 
-    private fun openGateway(profile: SshTunnelProfile, key: GatewayKey): GatewayHandle {
-        val config = profile.ssh
-        require(config.host.isNotBlank()) { "SSH host is required" }
-        require(config.username.isNotBlank()) { "SSH username is required" }
-        require(config.port in 1..65535) { "SSH port must be between 1 and 65535" }
-        require(config.password.isNotBlank() || config.privateKey.isNotBlank()) {
-            "An SSH password or private key is required"
+    private fun openGateway(
+        profile: SshTunnelProfile,
+        key: GatewayKey,
+        onHop: ((index: Int, hop: SshTunnelConfig, latencyMs: Long, error: String?) -> Unit)?,
+    ): GatewayHandle {
+        profile.hops.forEachIndexed { index, config ->
+            require(config.host.isNotBlank()) { "Hop ${index + 1}: SSH host is required" }
+            require(config.username.isNotBlank()) { "Hop ${index + 1}: SSH username is required" }
+            require(config.port in 1..65535) { "Hop ${index + 1}: SSH port must be between 1 and 65535" }
+            require(config.password.isNotBlank() || config.privateKey.isNotBlank()) {
+                "Hop ${index + 1}: an SSH password or private key is required"
+            }
         }
 
+        val sessions = mutableListOf<Session>()
+        val hopLatencies = mutableListOf<Long>()
+        try {
+            profile.hops.forEachIndexed { index, config ->
+                val previous = sessions.lastOrNull()
+                val started = System.nanoTime()
+                try {
+                    val session = openSession(profile, index, config, previous)
+                    sessions += session
+                    val latencyMs = (System.nanoTime() - started) / 1_000_000
+                    hopLatencies += latencyMs
+                    onHop?.invoke(index, config, latencyMs, null)
+                } catch (error: Exception) {
+                    val latencyMs = (System.nanoTime() - started) / 1_000_000
+                    val reason = error.message ?: "connection failed"
+                    onHop?.invoke(index, config, latencyMs, reason)
+                    val pinHint = if (config.hostKeyFingerprint.isNotBlank()) {
+                        " Check that the SSH host-key SHA-256 fingerprint is correct."
+                    } else {
+                        ""
+                    }
+                    throw HopConnectionException(
+                        "Hop ${index + 1} (${config.host}) failed: $reason.$pinHint",
+                        error,
+                    )
+                }
+            }
+            return GatewayHandle(key, sessions.toList(), hopLatencies.toList())
+        } catch (error: Exception) {
+            sessions.forEach(Session::disconnect)
+            throw error
+        }
+    }
+
+    private fun openSession(
+        profile: SshTunnelProfile,
+        index: Int,
+        config: SshTunnelConfig,
+        previous: Session?,
+    ): Session {
         val jsch = JSch().apply {
             hostKeyRepository = FingerprintHostKeyRepository(config.hostKeyFingerprint)
             if (config.privateKey.isNotBlank()) {
                 addIdentity(
-                    "puppycoder-${profile.id}",
+                    "puppycoder-${profile.id}-hop$index",
                     config.privateKey.toByteArray(),
                     null,
                     config.privateKeyPassphrase.takeIf(String::isNotBlank)?.toByteArray(),
                 )
             }
         }
-        val session = jsch.getSession(config.username, config.host, config.port)
+
+        val (sessionHost, sessionPort) = if (previous == null) {
+            config.host to config.port
+        } else {
+            val forwardPort = previous.setPortForwardingL(LOOPBACK, 0, config.host, config.port)
+            LOOPBACK to forwardPort
+        }
+        val session = jsch.getSession(config.username, sessionHost, sessionPort)
         try {
             config.password.takeIf(String::isNotBlank)?.let(session::setPassword)
             session.setConfig("StrictHostKeyChecking", "yes")
             session.serverAliveInterval = 15_000
             session.serverAliveCountMax = 3
             session.connect(CONNECT_TIMEOUT_MS)
-            return GatewayHandle(key, session)
+            return session
         } catch (error: Exception) {
             session.disconnect()
-            val pinHint = if (config.hostKeyFingerprint.isNotBlank()) {
-                " Check that the SSH host-key SHA-256 fingerprint is correct."
-            } else {
-                ""
-            }
-            throw IllegalStateException("SSH connection failed: ${error.message ?: "connection failed"}.$pinHint", error)
+            throw error
         }
     }
 
-    private data class GatewayKey(val config: SshTunnelConfig)
+    private class HopConnectionException(message: String, cause: Throwable) : Exception(message, cause)
+
+    private data class GatewayKey(val hops: List<SshTunnelConfig>)
 
     private data class GatewayHandle(
         val key: GatewayKey,
-        val session: Session,
+        val sessions: List<Session>,
+        val hopLatencies: List<Long>,
         val forwards: MutableMap<TunnelTarget, Int> = mutableMapOf(),
     )
 
@@ -297,6 +380,54 @@ private fun TunnelRouteRule.matchScore(target: TunnelTarget): Int? {
 }
 
 internal data class TunnelTarget(val host: String, val port: Int)
+
+internal fun SshTunnelConfig.label(): String = "$username@$host:$port"
+
+internal fun SshTunnelProfile.withIdentityNames(identities: List<SshIdentity>): SshTunnelProfile {
+    val byId = identities.associateBy(SshIdentity::id)
+    return copy(
+        hops = hops.map { hop ->
+            hop.identityId?.let(byId::get)?.let { identity -> hop.copy(identityName = identity.name) } ?: hop
+        },
+    )
+}
+
+internal fun SshTunnelProfile.withConnections(connections: List<SshConnection>): SshTunnelProfile {
+    val byId = connections.associateBy(SshConnection::id)
+    return copy(
+        hops = hops.map { hop ->
+            hop.connectionId?.let(byId::get)?.let { connection ->
+                connection.ssh.copy(connectionId = connection.id, connectionName = connection.name)
+            } ?: hop
+        },
+    )
+}
+
+internal fun SshConnection.withIdentityNames(identities: List<SshIdentity>): SshConnection {
+    val identity = ssh.identityId?.let { id -> identities.firstOrNull { it.id == id } } ?: return this
+    return copy(ssh = ssh.copy(identityName = identity.name))
+}
+
+internal fun SshTunnelProfile.resolved(identities: List<SshIdentity>): SshTunnelProfile {
+    if (hops.none { it.identityId != null }) return this
+    val byId = identities.associateBy(SshIdentity::id)
+    return copy(
+        hops = hops.map { hop ->
+            val identity = hop.identityId?.let(byId::get)
+            if (identity == null) {
+                hop
+            } else {
+                hop.copy(
+                    username = identity.username,
+                    password = if (identity.kind == SshIdentityKind.PASSWORD) identity.password else "",
+                    privateKey = if (identity.kind == SshIdentityKind.PRIVATE_KEY) identity.privateKey else "",
+                    privateKeyPassphrase = identity.privateKeyPassphrase,
+                    identityName = identity.name,
+                )
+            }
+        },
+    )
+}
 
 internal data class ServerDiscoveryCandidate(
     val kind: ServerKind,

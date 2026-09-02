@@ -95,36 +95,51 @@ internal fun RelayServer.toEntity(secretStore: SecretStore) = ComputerEntity(
 internal fun TunnelWithRoutes.toModel(secretStore: SecretStore) = SshTunnelProfile(
     id = profile.id,
     name = profile.name,
-    ssh = SshTunnelConfig(
-        host = profile.host,
-        port = profile.port,
-        username = profile.username,
-        password = runCatching { secretStore.decrypt(profile.encryptedPassword) }.getOrDefault(""),
-        privateKey = runCatching { secretStore.decrypt(profile.encryptedPrivateKey) }.getOrDefault(""),
-        privateKeyPassphrase = runCatching {
-            secretStore.decrypt(profile.encryptedPrivateKeyPassphrase)
-        }.getOrDefault(""),
-        hostKeyFingerprint = profile.hostKeyFingerprint,
-    ),
+    hops = hops
+        .sortedBy(TunnelHopEntity::hopIndex)
+        .map { hop ->
+            SshTunnelConfig(
+                host = hop.host,
+                port = hop.port,
+                username = hop.username,
+                password = runCatching { secretStore.decrypt(hop.encryptedPassword) }.getOrDefault(""),
+                privateKey = runCatching { secretStore.decrypt(hop.encryptedPrivateKey) }.getOrDefault(""),
+                privateKeyPassphrase = runCatching {
+                    secretStore.decrypt(hop.encryptedPrivateKeyPassphrase)
+                }.getOrDefault(""),
+                hostKeyFingerprint = hop.hostKeyFingerprint,
+                identityId = hop.identityId,
+                connectionId = hop.connectionId,
+            )
+        },
     routes = routes.sortedBy(TunnelRouteEntity::id).map { TunnelRouteRule(it.hostPattern, it.port) },
     priority = profile.priority,
     enabled = profile.enabled,
 )
 
-internal fun SshTunnelProfile.toEntities(secretStore: SecretStore): Pair<TunnelProfileEntity, List<TunnelRouteEntity>> {
+internal fun SshTunnelProfile.toEntities(secretStore: SecretStore): Triple<TunnelProfileEntity, List<TunnelHopEntity>, List<TunnelRouteEntity>> {
     val profile = TunnelProfileEntity(
         id = id,
         name = name,
-        host = ssh.host,
-        port = ssh.port,
-        username = ssh.username,
-        encryptedPassword = secretStore.encrypt(ssh.password),
-        encryptedPrivateKey = secretStore.encrypt(ssh.privateKey),
-        encryptedPrivateKeyPassphrase = secretStore.encrypt(ssh.privateKeyPassphrase),
-        hostKeyFingerprint = ssh.hostKeyFingerprint,
         priority = priority,
         enabled = enabled,
     )
+    val hopEntities = hops.mapIndexed { index, hop ->
+        TunnelHopEntity(
+            id = "$id-hop$index",
+            profileId = id,
+            hopIndex = index,
+            host = hop.host,
+            port = hop.port,
+            username = hop.username,
+            encryptedPassword = secretStore.encrypt(hop.password),
+            encryptedPrivateKey = secretStore.encrypt(hop.privateKey),
+            encryptedPrivateKeyPassphrase = secretStore.encrypt(hop.privateKeyPassphrase),
+            hostKeyFingerprint = hop.hostKeyFingerprint,
+            identityId = hop.identityId,
+            connectionId = hop.connectionId,
+        )
+    }
     val routeEntities = routes.mapIndexed { index, route ->
         TunnelRouteEntity(
             id = "$id-$index",
@@ -133,5 +148,55 @@ internal fun SshTunnelProfile.toEntities(secretStore: SecretStore): Pair<TunnelP
             port = route.port,
         )
     }
-    return profile to routeEntities
+    return Triple(profile, hopEntities, routeEntities)
 }
+
+internal fun TunnelIdentityEntity.toModel(secretStore: SecretStore) = SshIdentity(
+    id = id,
+    name = name,
+    kind = SshIdentityKind.valueOf(kind),
+    username = username,
+    password = runCatching { secretStore.decrypt(encryptedPassword) }.getOrDefault(""),
+    privateKey = runCatching { secretStore.decrypt(encryptedPrivateKey) }.getOrDefault(""),
+    privateKeyPassphrase = runCatching { secretStore.decrypt(encryptedPrivateKeyPassphrase) }.getOrDefault(""),
+)
+
+internal fun SshIdentity.toEntity(secretStore: SecretStore) = TunnelIdentityEntity(
+    id = id,
+    name = name,
+    kind = kind.name,
+    username = username,
+    encryptedPassword = secretStore.encrypt(password),
+    encryptedPrivateKey = secretStore.encrypt(privateKey),
+    encryptedPrivateKeyPassphrase = secretStore.encrypt(privateKeyPassphrase),
+)
+
+internal fun SshConnectionEntity.toModel(secretStore: SecretStore) = SshConnection(
+    id = id,
+    name = name,
+    ssh = SshTunnelConfig(
+        host = host,
+        port = port,
+        username = username,
+        password = runCatching { secretStore.decrypt(encryptedPassword) }.getOrDefault(""),
+        privateKey = runCatching { secretStore.decrypt(encryptedPrivateKey) }.getOrDefault(""),
+        privateKeyPassphrase = runCatching { secretStore.decrypt(encryptedPrivateKeyPassphrase) }.getOrDefault(""),
+        hostKeyFingerprint = hostKeyFingerprint,
+        identityId = identityId,
+        connectionId = id,
+        connectionName = name,
+    ),
+)
+
+internal fun SshConnection.toEntity(secretStore: SecretStore) = SshConnectionEntity(
+    id = id,
+    name = name,
+    host = ssh.host,
+    port = ssh.port,
+    username = ssh.username,
+    encryptedPassword = secretStore.encrypt(ssh.password),
+    encryptedPrivateKey = secretStore.encrypt(ssh.privateKey),
+    encryptedPrivateKeyPassphrase = secretStore.encrypt(ssh.privateKeyPassphrase),
+    hostKeyFingerprint = ssh.hostKeyFingerprint,
+    identityId = ssh.identityId,
+)

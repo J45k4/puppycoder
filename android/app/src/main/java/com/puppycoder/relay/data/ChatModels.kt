@@ -232,6 +232,10 @@ interface AgentConversationClient {
         remoteConversationId: String,
         onChanged: () -> Unit,
     ): RemoteResult<Closeable?>
+    suspend fun forceClaimConversation(
+        computer: RelayServer,
+        remoteConversationId: String,
+    ): RemoteResult<Unit>
     suspend fun downloadFile(
         computer: RelayServer,
         remotePath: String,

@@ -106,6 +106,34 @@ class CodexConnectionManagerTest {
     }
 
     @Test
+    fun sendsForceFlagWhenClaimingThreadWriter() = runBlocking {
+        val factory = FakeWebSocketFactory()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        factory.onRequest = { socket, message ->
+            val result = when (message.optString("method")) {
+                "thread/resume" -> JSONObject().put(
+                    "thread",
+                    JSONObject().put("id", message.getJSONObject("params").getString("threadId")),
+                )
+                else -> JSONObject()
+            }
+            socket.respond(message.getLong("id"), result)
+        }
+
+        val connection = CodexConnection(factory, REQUEST, scope)
+        try {
+            connection.attachThread("thread-1", JSONObject().put("force", true))
+
+            val resume = factory.sockets.single().sent.single { it.optString("method") == "thread/resume" }
+            assertTrue(resume.getJSONObject("params").getBoolean("force"))
+        } finally {
+            connection.close()
+            scope.cancel()
+            factory.close()
+        }
+    }
+
+    @Test
     fun unsubscribesOnlyAfterLastObserverAndResumesWhenObservedAgain() = runBlocking {
         withTimeout(10_000) {
             val factory = FakeWebSocketFactory()

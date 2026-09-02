@@ -1,11 +1,13 @@
 package com.puppycoder.relay
 
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
+import androidx.compose.ui.test.hasText
 import androidx.compose.ui.test.onAllNodesWithContentDescription
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollToNode
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.puppycoder.relay.data.SshTunnelConfig
 import com.puppycoder.relay.data.SshTunnelProfile
@@ -25,10 +27,12 @@ class ComputerEditingTest {
         val profile = SshTunnelProfile(
             id = "editable-computer",
             name = "Editable workstation",
-            ssh = SshTunnelConfig(
-                host = "workstation.example",
-                username = "puppy",
-                password = "secret",
+            hops = listOf(
+                SshTunnelConfig(
+                    host = "workstation.example",
+                    username = "puppy",
+                    password = "secret",
+                ),
             ),
             routes = listOf(TunnelRouteRule("127.0.0.1", 4310)),
             priority = 175,
@@ -45,9 +49,13 @@ class ComputerEditingTest {
 
         compose.onNodeWithText("Edit computer").fetchSemanticsNode()
         check(compose.onAllNodesWithText(profile.name).fetchSemanticsNodes().isNotEmpty())
-        compose.onNodeWithText(profile.ssh.host).fetchSemanticsNode()
+        check(compose.onAllNodesWithText(profile.ssh.host).fetchSemanticsNodes().isNotEmpty())
+        compose.onNodeWithContentDescription("SSH computer editor fields")
+            .performScrollToNode(hasText("Priority"))
         compose.onNodeWithText(profile.priority.toString()).fetchSemanticsNode()
 
+        compose.onNodeWithContentDescription("SSH computer editor fields")
+            .performScrollToNode(hasText("Edit computer"))
         compose.onNodeWithContentDescription("Close").performClick()
         runBlocking { repository.deleteTunnel(profile.id) }
     }

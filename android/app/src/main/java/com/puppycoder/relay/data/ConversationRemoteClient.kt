@@ -277,6 +277,24 @@ class ConversationRemoteClient(
         }.getOrElse { RemoteResult.Error(it.conversationMessage()) }
     }
 
+    override suspend fun forceClaimConversation(
+        computer: RelayServer,
+        remoteConversationId: String,
+    ): RemoteResult<Unit> {
+        if (computer.kind != ServerKind.CODEX) return RemoteResult.Error("Writer claims are only available for Codex")
+        val endpoint = withContext(Dispatchers.IO) {
+            runCatching { sshTunnels.route(computer, tunnelProfiles) }
+        }.getOrElse { return RemoteResult.Error(it.conversationMessage()) }
+        return runCatching {
+            val connection = codexConnections.connection(
+                computer.id,
+                computer.authorizedRequest(endpoint.url.conversationWebSocketBase()).build(),
+            )
+            connection.attachThread(remoteConversationId, JSONObject().put("force", true))
+            RemoteResult.Success(Unit)
+        }.getOrElse { RemoteResult.Error(it.conversationMessage()) }
+    }
+
     override suspend fun downloadFile(
         computer: RelayServer,
         remotePath: String,

@@ -15,7 +15,10 @@ import com.puppycoder.relay.data.DownloadedRemoteFile
 import com.puppycoder.relay.data.RelayServer
 import com.puppycoder.relay.data.RemoteResult
 import com.puppycoder.relay.data.RemoteFileProgress
+import com.puppycoder.relay.data.SshIdentity
+import com.puppycoder.relay.data.SshConnection
 import com.puppycoder.relay.data.SshTunnelProfile
+import com.puppycoder.relay.data.SshTunnelTest
 import com.puppycoder.relay.data.ToolActivity
 import com.puppycoder.relay.data.TunnelRouteRule
 import com.puppycoder.relay.update.AppUpdateState
@@ -32,6 +35,7 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -49,7 +53,10 @@ class PuppyCoderViewModel(application: Application) : AndroidViewModel(applicati
     private val _historyPaging = MutableStateFlow(HistoryPagingState())
     private val _chatSearchQuery = MutableStateFlow("")
     private val _serverDiscovery = MutableStateFlow(ServerDiscoveryState())
+    private val _tunnelTests = MutableStateFlow<Map<String, TunnelTestState>>(emptyMap())
+    private val _sshConnectionTests = MutableStateFlow<Map<String, TunnelTestState>>(emptyMap())
     private val _remoteFileViewer = MutableStateFlow(RemoteFileViewerState())
+    private val _writerClaim = MutableStateFlow(WriterClaimState())
     private val remoteFilePreviewCache = mutableMapOf<String, DownloadedRemoteFile>()
     private val _chatSortOrder = MutableStateFlow(
         runCatching {
@@ -83,7 +90,10 @@ class PuppyCoderViewModel(application: Application) : AndroidViewModel(applicati
     val historyPaging: StateFlow<HistoryPagingState> = _historyPaging
     val chatSearchQuery: StateFlow<String> = _chatSearchQuery
     val serverDiscovery: StateFlow<ServerDiscoveryState> = _serverDiscovery
+    val tunnelTests: StateFlow<Map<String, TunnelTestState>> = _tunnelTests
+    val sshConnectionTests: StateFlow<Map<String, TunnelTestState>> = _sshConnectionTests
     val remoteFileViewer: StateFlow<RemoteFileViewerState> = _remoteFileViewer
+    val writerClaim: StateFlow<WriterClaimState> = _writerClaim
     val chatSortOrder: StateFlow<ChatSortOrder> = _chatSortOrder
     val chatGroupMode: StateFlow<ChatGroupMode> = _chatGroupMode
     val collapsedChatGroups: StateFlow<Set<String>> = _collapsedChatGroups
@@ -98,6 +108,16 @@ class PuppyCoderViewModel(application: Application) : AndroidViewModel(applicati
         emptyList(),
     )
     val tunnels: StateFlow<List<SshTunnelProfile>> = repository.tunnels.stateIn(
+        viewModelScope,
+        SharingStarted.WhileSubscribed(5_000),
+        emptyList(),
+    )
+    val identities: StateFlow<List<SshIdentity>> = repository.identities.stateIn(
+        viewModelScope,
+        SharingStarted.WhileSubscribed(5_000),
+        emptyList(),
+    )
+    val sshConnections: StateFlow<List<SshConnection>> = repository.sshConnections.stateIn(
         viewModelScope,
         SharingStarted.WhileSubscribed(5_000),
         emptyList(),
@@ -147,6 +167,7 @@ class PuppyCoderViewModel(application: Application) : AndroidViewModel(applicati
 
     fun openChat(id: String) {
         stopTrackingOpenConversation()
+        _writerClaim.value = WriterClaimState()
         trackedConversationId = id
         _historyPaging.value = HistoryPagingState(
             conversationId = id,
@@ -210,6 +231,7 @@ class PuppyCoderViewModel(application: Application) : AndroidViewModel(applicati
         stopTrackingOpenConversation()
         selectedChatId.value = null
         _historyPaging.value = HistoryPagingState()
+        _writerClaim.value = WriterClaimState()
     }
 
     private fun scheduleLiveHistoryRefresh(conversationId: String) {
@@ -288,6 +310,7 @@ class PuppyCoderViewModel(application: Application) : AndroidViewModel(applicati
         }
         when (result) {
             is RemoteResult.Success -> {
+                if (_writerClaim.value.conversationId == conversationId) _writerClaim.value = WriterClaimState()
                 if (
                     conversationTrackingGeneration == generation &&
                     trackedConversationId == conversationId &&
@@ -304,9 +327,38 @@ class PuppyCoderViewModel(application: Application) : AndroidViewModel(applicati
                     trackedConversationId == conversationId &&
                     result.message.isActiveWriterConflict()
                 ) {
+                    _writerClaim.value = WriterClaimState(conversationId = conversationId, message = result.message)
                     openConversationSubscription = startOpenConversationPolling(conversationId, generation)
                 } else if (conversationTrackingGeneration == generation && trackedConversationId == conversationId) {
                     _notices.emit("Live updates unavailable: ${result.message}")
+                }
+            }
+        }
+    }
+
+    fun showWriterClaimDialog() {
+        _writerClaim.update { if (it.conversationId != null) it.copy(dialogVisible = true) else it }
+    }
+
+    fun dismissWriterClaim() {
+        _writerClaim.update { it.copy(dialogVisible = false) }
+    }
+
+    fun forceClaimWriter() {
+        val conflict = _writerClaim.value
+        val conversationId = conflict.conversationId ?: return
+        if (conflict.claiming || selectedChatId.value != conversationId) return
+        _writerClaim.value = conflict.copy(claiming = true)
+        viewModelScope.launch {
+            when (val result = repository.forceClaimConversation(conversationId)) {
+                is RemoteResult.Success -> {
+                    openConversationSubscription?.close()
+                    openConversationSubscription = null
+                    _writerClaim.value = WriterClaimState()
+                    ensureOpenConversationSubscription(conversationId)
+                }
+                is RemoteResult.Error -> {
+                    _writerClaim.value = _writerClaim.value.copy(claiming = false, message = result.message)
                 }
             }
         }
@@ -604,22 +656,77 @@ class PuppyCoderViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     fun testTunnel(id: String) {
+        _tunnelTests.update { it + (id to TunnelTestState(id, loading = true)) }
         viewModelScope.launch {
             when (val result = repository.testTunnel(id)) {
-                is RemoteResult.Success -> _notices.emit(
-                    buildString {
-                        append(result.value.message)
-                        result.value.target?.let { append(" · ").append(it) }
-                        append(" · ").append(result.value.latencyMs).append(" ms")
-                    },
-                )
-                is RemoteResult.Error -> _notices.emit(result.message)
+                is RemoteResult.Success -> {
+                    _tunnelTests.update { it + (id to TunnelTestState(id, loading = false, result = result.value)) }
+                    _notices.emit(
+                        buildString {
+                            append(result.value.message)
+                            result.value.target?.let { append(" · ").append(it) }
+                            append(" · ").append(result.value.latencyMs).append(" ms")
+                        },
+                    )
+                }
+                is RemoteResult.Error -> {
+                    _tunnelTests.update { it - id }
+                    _notices.emit(result.message)
+                }
+            }
+        }
+    }
+
+    fun testSshConnection(id: String) {
+        _sshConnectionTests.update { it + (id to TunnelTestState(id, loading = true)) }
+        viewModelScope.launch {
+            when (val result = repository.testSshConnection(id)) {
+                is RemoteResult.Success -> {
+                    _sshConnectionTests.update {
+                        it + (id to TunnelTestState(id, loading = false, result = result.value))
+                    }
+                    _notices.emit("${result.value.message} · ${result.value.latencyMs} ms")
+                }
+                is RemoteResult.Error -> {
+                    _sshConnectionTests.update { it - id }
+                    _notices.emit(result.message)
+                }
             }
         }
     }
 
     fun deleteTunnel(id: String) {
         viewModelScope.launch { repository.deleteTunnel(id) }
+    }
+
+    fun saveIdentity(identity: SshIdentity) {
+        viewModelScope.launch {
+            runCatching { repository.saveIdentity(identity) }
+                .onFailure { _notices.emit(it.message ?: "Could not save the identity") }
+        }
+    }
+
+    fun deleteIdentity(id: String) {
+        viewModelScope.launch {
+            repository.deleteIdentity(id).onFailure {
+                _notices.emit(it.message ?: "Could not delete the identity")
+            }
+        }
+    }
+
+    fun saveSshConnection(connection: SshConnection) {
+        viewModelScope.launch {
+            runCatching { repository.saveSshConnection(connection) }
+                .onFailure { _notices.emit(it.message ?: "Could not save the SSH connection") }
+        }
+    }
+
+    fun deleteSshConnection(id: String) {
+        viewModelScope.launch {
+            repository.deleteSshConnection(id).onFailure {
+                _notices.emit(it.message ?: "Could not delete the SSH connection")
+            }
+        }
     }
 
     fun markComputerOffline(id: String) {
@@ -688,6 +795,13 @@ data class HistoryPagingState(
     }
 }
 
+data class WriterClaimState(
+    val conversationId: String? = null,
+    val message: String? = null,
+    val claiming: Boolean = false,
+    val dialogVisible: Boolean = false,
+)
+
 internal fun visibleMessagesForHistory(
     messages: List<ChatMessage>,
     paging: HistoryPagingState,
@@ -708,6 +822,12 @@ data class ServerDiscoveryState(
     val results: List<DiscoveredAgentServer> = emptyList(),
     val addedCount: Int = 0,
     val error: String? = null,
+)
+
+data class TunnelTestState(
+    val tunnelId: String,
+    val loading: Boolean = false,
+    val result: SshTunnelTest? = null,
 )
 
 data class RemoteFileViewerState(

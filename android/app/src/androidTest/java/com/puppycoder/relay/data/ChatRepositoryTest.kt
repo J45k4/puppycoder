@@ -172,7 +172,7 @@ class ChatRepositoryTest {
         val tunnel = SshTunnelProfile(
             id = "tunnel-1",
             name = "Gateway",
-            ssh = SshTunnelConfig(host = "gateway.example", username = "puppy", password = "secret"),
+            hops = listOf(SshTunnelConfig(host = "gateway.example", username = "puppy", password = "secret")),
             routes = listOf(TunnelRouteRule("127.0.0.1", 4310)),
         )
         repository.saveTunnel(tunnel)
@@ -199,10 +199,12 @@ class ChatRepositoryTest {
         val original = SshTunnelProfile(
             id = "tunnel-edit",
             name = "Workstation",
-            ssh = SshTunnelConfig(
-                host = "old.example",
-                username = "puppy",
-                password = "old-secret",
+            hops = listOf(
+                SshTunnelConfig(
+                    host = "old.example",
+                    username = "puppy",
+                    password = "old-secret",
+                ),
             ),
             routes = listOf(TunnelRouteRule("127.0.0.1", 4310)),
             priority = 100,
@@ -212,7 +214,7 @@ class ChatRepositoryTest {
         repository.saveTunnel(
             original.copy(
                 name = "Office workstation",
-                ssh = original.ssh.copy(host = "new.example", password = "new-secret"),
+                hops = listOf(original.hops.single().copy(host = "new.example", password = "new-secret")),
                 routes = listOf(TunnelRouteRule("agent.internal", 4096)),
                 priority = 250,
             ),
@@ -339,7 +341,7 @@ class ChatRepositoryTest {
         val tunnel = SshTunnelProfile(
             id = "ssh-computer",
             name = "Workstation",
-            ssh = SshTunnelConfig(host = "workstation.example", username = "puppy", password = "secret"),
+            hops = listOf(SshTunnelConfig(host = "workstation.example", username = "puppy", password = "secret")),
             routes = listOf(TunnelRouteRule("127.0.0.1", 4310)),
         )
         repository.saveTunnel(tunnel)
@@ -362,6 +364,76 @@ class ChatRepositoryTest {
         assertEquals(tunnel.id, service.tunnelProfileId)
         assertEquals("/home/puppy", service.workspace)
     }
+
+    @Test
+    fun identityBackedHopsReceiveResolvedCredentialsAndSurviveEdits() = runBlocking {
+        val identity = SshIdentity(
+            id = "identity-1",
+            name = "Work laptop key",
+            kind = SshIdentityKind.PRIVATE_KEY,
+            username = "puppy",
+            privateKey = "KEY-DATA",
+            privateKeyPassphrase = "key-pass",
+        )
+        repository.saveIdentity(identity)
+        val tunnel = SshTunnelProfile(
+            id = "tunnel-identity",
+            name = "Workstation",
+            hops = listOf(
+                SshTunnelConfig(host = "gateway.example", identityId = identity.id),
+            ),
+            routes = listOf(TunnelRouteRule("127.0.0.1", 4310)),
+        )
+        repository.saveTunnel(tunnel)
+
+        val profilesSeenByClient = mutableListOf<List<SshTunnelProfile>>()
+        client.profileSink = { profilesSeenByClient += it }
+        val stored = repository.tunnels.first { it.singleOrNull()?.id == "tunnel-identity" }.single()
+        assertEquals(identity.id, stored.hops.single().identityId)
+        assertEquals("", stored.hops.single().privateKey)
+
+        repository.saveIdentity(identity.copy(privateKey = "ROTATED-KEY"))
+        repository.saveTunnel(tunnel)
+
+        val resolved = profilesSeenByClient.lastOrNull()?.firstOrNull { it.id == "tunnel-identity" }
+        assertEquals("puppy", resolved?.hops?.single()?.username)
+        assertEquals("ROTATED-KEY", resolved?.hops?.single()?.privateKey)
+        assertEquals("key-pass", resolved?.hops?.single()?.privateKeyPassphrase)
+        client.profileSink = null
+    }
+
+    @Test
+    fun identitiesInUseCannotBeDeleted() = runBlocking {
+        val identity = SshIdentity(
+            id = "identity-in-use",
+            name = "Gateway login",
+            kind = SshIdentityKind.PASSWORD,
+            username = "entry",
+            password = "secret",
+        )
+        repository.saveIdentity(identity)
+        repository.saveTunnel(
+            SshTunnelProfile(
+                id = "tunnel-identity-use",
+                name = "Workstation",
+                hops = listOf(SshTunnelConfig(host = "gateway.example", identityId = identity.id)),
+                routes = listOf(TunnelRouteRule("127.0.0.1", 4310)),
+            ),
+        )
+
+        assertTrue(repository.deleteIdentity(identity.id).isFailure)
+
+        repository.saveTunnel(
+            SshTunnelProfile(
+                id = "tunnel-identity-use",
+                name = "Workstation",
+                hops = listOf(SshTunnelConfig(host = "gateway.example", username = "puppy", password = "secret")),
+                routes = listOf(TunnelRouteRule("127.0.0.1", 4310)),
+            ),
+        )
+        assertTrue(repository.deleteIdentity(identity.id).isSuccess)
+        assertTrue(repository.identities.first { it.isEmpty() }.isEmpty())
+    }
 }
 
 private class FakeConversationClient : AgentConversationClient {
@@ -371,6 +443,7 @@ private class FakeConversationClient : AgentConversationClient {
     var remoteConversations: List<RemoteConversationSummary> = emptyList()
     var remoteMessages: List<RemoteChatMessage> = emptyList()
     val closedTunnelProfiles = mutableListOf<String>()
+    var profileSink: ((List<SshTunnelProfile>) -> Unit)? = null
 
     override suspend fun send(
         computer: RelayServer,
@@ -405,6 +478,8 @@ private class FakeConversationClient : AgentConversationClient {
         remoteConversationId: String,
         onChanged: () -> Unit,
     ) = RemoteResult.Success(null)
+    override suspend fun forceClaimConversation(computer: RelayServer, remoteConversationId: String) =
+        RemoteResult.Success(Unit)
     override suspend fun downloadFile(
         computer: RelayServer,
         remotePath: String,
@@ -416,7 +491,9 @@ private class FakeConversationClient : AgentConversationClient {
         RemoteResult.Success(SshTunnelTest("ok", 1))
     override suspend fun discoverServers(profile: SshTunnelProfile) =
         RemoteResult.Success(emptyList<DiscoveredAgentServer>())
-    override fun setTunnelProfiles(profiles: List<SshTunnelProfile>) = Unit
+    override fun setTunnelProfiles(profiles: List<SshTunnelProfile>) {
+        profileSink?.invoke(profiles)
+    }
     override fun closeTunnelProfile(profileId: String) {
         closedTunnelProfiles += profileId
     }

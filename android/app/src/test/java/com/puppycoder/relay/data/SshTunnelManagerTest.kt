@@ -99,6 +99,104 @@ class SshTunnelManagerTest {
         )
     }
 
+    @Test
+    fun tunnelRequiresAtLeastOneHop() {
+        assertThrows(IllegalArgumentException::class.java) {
+            SshTunnelProfile(
+                id = "empty",
+                name = "empty",
+                hops = emptyList(),
+                routes = listOf(TunnelRouteRule("*", null)),
+            )
+        }
+    }
+
+    @Test
+    fun sshAccessorPointsAtTheFinalHop() {
+        val tunnel = SshTunnelProfile(
+            id = "chain",
+            name = "chain",
+            hops = listOf(
+                SshTunnelConfig(host = "gateway.example", username = "entry", password = "secret"),
+                SshTunnelConfig(host = "bastion.internal", username = "puppy", password = "secret"),
+            ),
+            routes = listOf(TunnelRouteRule("*", null)),
+        )
+
+        assertEquals("bastion.internal", tunnel.ssh.host)
+    }
+
+    @Test
+    fun hopLabelFormatsUserHostAndPort() {
+        val hop = SshTunnelConfig(host = "bastion.internal", port = 2222, username = "puppy", password = "secret")
+
+        assertEquals("puppy@bastion.internal:2222", hop.label())
+    }
+
+    @Test
+    fun identityBackedHopsResolveCredentialsFromTheIdentity() {
+        val keyIdentity = SshIdentity(
+            id = "key-1",
+            name = "Work laptop key",
+            kind = SshIdentityKind.PRIVATE_KEY,
+            username = "puppy",
+            privateKey = "KEY-DATA",
+            privateKeyPassphrase = "key-pass",
+        )
+        val passwordIdentity = SshIdentity(
+            id = "pass-1",
+            name = "Gateway password",
+            kind = SshIdentityKind.PASSWORD,
+            username = "entry",
+            password = "gate-pass",
+        )
+        val tunnel = SshTunnelProfile(
+            id = "chain",
+            name = "chain",
+            hops = listOf(
+                SshTunnelConfig(
+                    host = "gateway.example",
+                    identityId = "pass-1",
+                    hostKeyFingerprint = "SHA256:aaa",
+                ),
+                SshTunnelConfig(
+                    host = "bastion.internal",
+                    identityId = "key-1",
+                    hostKeyFingerprint = "SHA256:bbb",
+                ),
+            ),
+            routes = listOf(TunnelRouteRule("*", null)),
+        )
+
+        val resolved = tunnel.resolved(listOf(passwordIdentity, keyIdentity))
+
+        assertEquals("entry", resolved.hops[0].username)
+        assertEquals("gate-pass", resolved.hops[0].password)
+        assertEquals("", resolved.hops[0].privateKey)
+        assertEquals("Gateway password", resolved.hops[0].identityName)
+        assertEquals("puppy", resolved.hops[1].username)
+        assertEquals("KEY-DATA", resolved.hops[1].privateKey)
+        assertEquals("", resolved.hops[1].password)
+        assertEquals("key-pass", resolved.hops[1].privateKeyPassphrase)
+        assertEquals("SHA256:aaa", resolved.hops[0].hostKeyFingerprint)
+        assertEquals("pass-1", resolved.hops[0].identityId)
+    }
+
+    @Test
+    fun missingIdentityLeavesHopUnresolved() {
+        val tunnel = SshTunnelProfile(
+            id = "chain",
+            name = "chain",
+            hops = listOf(SshTunnelConfig(host = "gateway.example", identityId = "gone")),
+            routes = listOf(TunnelRouteRule("*", null)),
+        )
+
+        val resolved = tunnel.resolved(emptyList())
+
+        assertEquals("", resolved.hops.single().username)
+        assertEquals("gone", resolved.hops.single().identityId)
+    }
+
     private fun server(endpoint: String) = RelayServer(
         name = "test",
         kind = ServerKind.OPENCODE,
@@ -114,7 +212,7 @@ class SshTunnelManagerTest {
     ) = SshTunnelProfile(
         id = id,
         name = id,
-        ssh = SshTunnelConfig(host = "gateway.example", username = "puppy", password = "secret"),
+        hops = listOf(SshTunnelConfig(host = "gateway.example", username = "puppy", password = "secret")),
         routes = listOf(TunnelRouteRule(pattern, port)),
         priority = priority,
     )

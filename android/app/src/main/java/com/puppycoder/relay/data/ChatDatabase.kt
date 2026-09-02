@@ -41,6 +41,26 @@ data class ComputerEntity(
 data class TunnelProfileEntity(
     @androidx.room.PrimaryKey val id: String,
     val name: String,
+    val priority: Int,
+    val enabled: Boolean,
+)
+
+@Entity(
+    tableName = "tunnel_hops",
+    foreignKeys = [
+        ForeignKey(
+            entity = TunnelProfileEntity::class,
+            parentColumns = ["id"],
+            childColumns = ["profileId"],
+            onDelete = ForeignKey.CASCADE,
+        ),
+    ],
+    indices = [Index("profileId"), Index(value = ["profileId", "hopIndex"]), Index("connectionId")],
+)
+data class TunnelHopEntity(
+    @androidx.room.PrimaryKey val id: String,
+    val profileId: String,
+    val hopIndex: Int,
     val host: String,
     val port: Int,
     val username: String,
@@ -48,8 +68,33 @@ data class TunnelProfileEntity(
     val encryptedPrivateKey: String,
     val encryptedPrivateKeyPassphrase: String,
     val hostKeyFingerprint: String,
-    val priority: Int,
-    val enabled: Boolean,
+    val identityId: String?,
+    val connectionId: String?,
+)
+
+@Entity(tableName = "ssh_connections")
+data class SshConnectionEntity(
+    @androidx.room.PrimaryKey val id: String,
+    val name: String,
+    val host: String,
+    val port: Int,
+    val username: String,
+    val encryptedPassword: String,
+    val encryptedPrivateKey: String,
+    val encryptedPrivateKeyPassphrase: String,
+    val hostKeyFingerprint: String,
+    val identityId: String?,
+)
+
+@Entity(tableName = "tunnel_identities")
+data class TunnelIdentityEntity(
+    @androidx.room.PrimaryKey val id: String,
+    val name: String,
+    val kind: String,
+    val username: String,
+    val encryptedPassword: String,
+    val encryptedPrivateKey: String,
+    val encryptedPrivateKeyPassphrase: String,
 )
 
 @Entity(
@@ -75,6 +120,8 @@ data class TunnelWithRoutes(
     @Embedded val profile: TunnelProfileEntity,
     @Relation(parentColumn = "id", entityColumn = "profileId")
     val routes: List<TunnelRouteEntity>,
+    @Relation(parentColumn = "id", entityColumn = "profileId")
+    val hops: List<TunnelHopEntity>,
 )
 
 @Entity(
@@ -211,18 +258,59 @@ interface ChatDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertTunnelRoutes(routes: List<TunnelRouteEntity>)
 
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertTunnelHops(hops: List<TunnelHopEntity>)
+
     @Query("DELETE FROM tunnel_routes WHERE profileId = :profileId")
     suspend fun deleteTunnelRoutes(profileId: String)
+
+    @Query("DELETE FROM tunnel_hops WHERE profileId = :profileId")
+    suspend fun deleteTunnelHops(profileId: String)
 
     @Query("DELETE FROM tunnel_profiles WHERE id = :id")
     suspend fun deleteTunnel(id: String)
 
     @Transaction
-    suspend fun upsertTunnel(profile: TunnelProfileEntity, routes: List<TunnelRouteEntity>) {
+    suspend fun upsertTunnel(profile: TunnelProfileEntity, hops: List<TunnelHopEntity>, routes: List<TunnelRouteEntity>) {
         upsertTunnelProfile(profile)
+        deleteTunnelHops(profile.id)
+        upsertTunnelHops(hops)
         deleteTunnelRoutes(profile.id)
         upsertTunnelRoutes(routes)
     }
+
+    @Query("SELECT * FROM tunnel_identities ORDER BY name COLLATE NOCASE")
+    fun observeIdentities(): Flow<List<TunnelIdentityEntity>>
+
+    @Query("SELECT * FROM tunnel_identities ORDER BY name COLLATE NOCASE")
+    suspend fun getIdentities(): List<TunnelIdentityEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertIdentity(identity: TunnelIdentityEntity)
+
+    @Query("DELETE FROM tunnel_identities WHERE id = :id")
+    suspend fun deleteIdentity(id: String)
+
+    @Query("SELECT COUNT(*) FROM tunnel_hops WHERE identityId = :identityId")
+    suspend fun hopsUsingIdentity(identityId: String): Int
+
+    @Query("SELECT COUNT(*) FROM ssh_connections WHERE identityId = :identityId")
+    suspend fun connectionsUsingIdentity(identityId: String): Int
+
+    @Query("SELECT * FROM ssh_connections ORDER BY name COLLATE NOCASE")
+    fun observeSshConnections(): Flow<List<SshConnectionEntity>>
+
+    @Query("SELECT * FROM ssh_connections ORDER BY name COLLATE NOCASE")
+    suspend fun getSshConnections(): List<SshConnectionEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertSshConnection(connection: SshConnectionEntity)
+
+    @Query("DELETE FROM ssh_connections WHERE id = :id")
+    suspend fun deleteSshConnection(id: String)
+
+    @Query("SELECT COUNT(*) FROM tunnel_hops WHERE connectionId = :connectionId")
+    suspend fun hopsUsingSshConnection(connectionId: String): Int
 
     @Query("SELECT * FROM conversations ORDER BY updatedAt DESC")
     fun observeConversations(): Flow<List<ConversationEntity>>
@@ -335,13 +423,16 @@ interface ChatDao {
     entities = [
         ComputerEntity::class,
         TunnelProfileEntity::class,
+        TunnelHopEntity::class,
+        SshConnectionEntity::class,
         TunnelRouteEntity::class,
+        TunnelIdentityEntity::class,
         ConversationEntity::class,
         ChatMessageEntity::class,
         MessageImageEntity::class,
         ToolActivityEntity::class,
     ],
-    version = 3,
+    version = 6,
     exportSchema = true,
 )
 abstract class PuppyCoderDatabase : RoomDatabase() {
@@ -355,7 +446,7 @@ abstract class PuppyCoderDatabase : RoomDatabase() {
                 context.applicationContext,
                 PuppyCoderDatabase::class.java,
                 "puppycoder.db",
-            ).addMigrations(MIGRATION_1_2, MIGRATION_2_3).build().also { instance = it }
+            ).addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6).build().also { instance = it }
         }
 
         val MIGRATION_1_2 = object : Migration(1, 2) {
@@ -378,6 +469,86 @@ abstract class PuppyCoderDatabase : RoomDatabase() {
                 )
                 database.execSQL(
                     "CREATE INDEX IF NOT EXISTS `index_message_images_messageId` ON `message_images` (`messageId`)",
+                )
+            }
+        }
+
+        val MIGRATION_3_4 = object : Migration(3, 4) {
+            override fun migrate(database: SupportSQLiteDatabase) {
+                database.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `tunnel_hops` (" +
+                        "`id` TEXT NOT NULL, `profileId` TEXT NOT NULL, `hopIndex` INTEGER NOT NULL, " +
+                        "`host` TEXT NOT NULL, `port` INTEGER NOT NULL, `username` TEXT NOT NULL, " +
+                        "`encryptedPassword` TEXT NOT NULL, `encryptedPrivateKey` TEXT NOT NULL, " +
+                        "`encryptedPrivateKeyPassphrase` TEXT NOT NULL, `hostKeyFingerprint` TEXT NOT NULL, " +
+                        "PRIMARY KEY(`id`), FOREIGN KEY(`profileId`) REFERENCES `tunnel_profiles`(`id`) " +
+                        "ON UPDATE NO ACTION ON DELETE CASCADE)",
+                )
+                database.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_tunnel_hops_profileId` ON `tunnel_hops` (`profileId`)",
+                )
+                database.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_tunnel_hops_profileId_hopIndex` ON `tunnel_hops` (`profileId`, `hopIndex`)",
+                )
+                database.execSQL(
+                    "INSERT INTO tunnel_hops (id, profileId, hopIndex, host, port, username, encryptedPassword, " +
+                        "encryptedPrivateKey, encryptedPrivateKeyPassphrase, hostKeyFingerprint) " +
+                        "SELECT id || '-hop0', id, 0, host, port, username, encryptedPassword, " +
+                        "encryptedPrivateKey, encryptedPrivateKeyPassphrase, hostKeyFingerprint " +
+                        "FROM tunnel_profiles",
+                )
+                database.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `tunnel_profiles_new` (" +
+                        "`id` TEXT NOT NULL, `name` TEXT NOT NULL, `priority` INTEGER NOT NULL, " +
+                        "`enabled` INTEGER NOT NULL, PRIMARY KEY(`id`))",
+                )
+                database.execSQL(
+                    "INSERT INTO tunnel_profiles_new (id, name, priority, enabled) " +
+                        "SELECT id, name, priority, enabled FROM tunnel_profiles",
+                )
+                database.execSQL("DROP TABLE tunnel_profiles")
+                database.execSQL("ALTER TABLE tunnel_profiles_new RENAME TO tunnel_profiles")
+            }
+        }
+
+        val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(database: SupportSQLiteDatabase) {
+                database.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `tunnel_identities` (" +
+                        "`id` TEXT NOT NULL, `name` TEXT NOT NULL, `kind` TEXT NOT NULL, " +
+                        "`username` TEXT NOT NULL, `encryptedPassword` TEXT NOT NULL, " +
+                        "`encryptedPrivateKey` TEXT NOT NULL, `encryptedPrivateKeyPassphrase` TEXT NOT NULL, " +
+                        "PRIMARY KEY(`id`))",
+                )
+                database.execSQL("ALTER TABLE tunnel_hops ADD COLUMN `identityId` TEXT")
+            }
+        }
+
+        val MIGRATION_5_6 = object : Migration(5, 6) {
+            override fun migrate(database: SupportSQLiteDatabase) {
+                database.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `ssh_connections` (" +
+                        "`id` TEXT NOT NULL, `name` TEXT NOT NULL, `host` TEXT NOT NULL, " +
+                        "`port` INTEGER NOT NULL, `username` TEXT NOT NULL, " +
+                        "`encryptedPassword` TEXT NOT NULL, `encryptedPrivateKey` TEXT NOT NULL, " +
+                        "`encryptedPrivateKeyPassphrase` TEXT NOT NULL, `hostKeyFingerprint` TEXT NOT NULL, " +
+                        "`identityId` TEXT, PRIMARY KEY(`id`))",
+                )
+                database.execSQL("ALTER TABLE tunnel_hops ADD COLUMN `connectionId` TEXT")
+                database.execSQL(
+                    "INSERT INTO ssh_connections (id, name, host, port, username, encryptedPassword, " +
+                        "encryptedPrivateKey, encryptedPrivateKeyPassphrase, hostKeyFingerprint, identityId) " +
+                        "SELECT h.profileId || '-connection-' || h.hopIndex, " +
+                        "p.name || ' · Hop ' || (h.hopIndex + 1), h.host, h.port, h.username, " +
+                        "h.encryptedPassword, h.encryptedPrivateKey, h.encryptedPrivateKeyPassphrase, " +
+                        "h.hostKeyFingerprint, h.identityId FROM tunnel_hops h " +
+                        "INNER JOIN tunnel_profiles p ON p.id = h.profileId",
+                )
+                database.execSQL(
+                    "UPDATE tunnel_hops SET connectionId = profileId || '-connection-' || hopIndex",
+                )
+                database.execSQL(
+                    "CREATE INDEX IF NOT EXISTS `index_tunnel_hops_connectionId` ON `tunnel_hops` (`connectionId`)",
                 )
             }
         }

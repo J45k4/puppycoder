@@ -9,6 +9,7 @@ import androidx.core.content.FileProvider
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -43,10 +44,14 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ArrowForward
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
@@ -84,6 +89,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -130,8 +136,13 @@ import com.puppycoder.relay.data.RelayServer
 import com.puppycoder.relay.data.RemoteResult
 import com.puppycoder.relay.data.ServerKind
 import com.puppycoder.relay.data.ServerRouteMode
+import com.puppycoder.relay.data.SshIdentity
+import com.puppycoder.relay.data.SshIdentityKind
+import com.puppycoder.relay.data.SshConnection
 import com.puppycoder.relay.data.SshTunnelConfig
+import com.puppycoder.relay.data.SshTunnelHopTest
 import com.puppycoder.relay.data.SshTunnelProfile
+import com.puppycoder.relay.data.SshTunnelTest
 import com.puppycoder.relay.data.ToolActivity
 import com.puppycoder.relay.data.ToolActivityState
 import com.puppycoder.relay.data.TunnelRouteRule
@@ -151,6 +162,8 @@ import kotlinx.coroutines.withContext
 private enum class MainScreen {
     CHATS,
     SETTINGS,
+    IDENTITIES,
+    CONNECTIONS,
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -159,6 +172,8 @@ fun RelayApp(viewModel: PuppyCoderViewModel = viewModel()) {
     val chats by viewModel.chats.collectAsState()
     val computers by viewModel.computers.collectAsState()
     val tunnels by viewModel.tunnels.collectAsState()
+    val identities by viewModel.identities.collectAsState()
+    val sshConnections by viewModel.sshConnections.collectAsState()
     val conversation by viewModel.selectedConversation.collectAsState()
     val messages by viewModel.messages.collectAsState()
     val tools by viewModel.tools.collectAsState()
@@ -166,7 +181,10 @@ fun RelayApp(viewModel: PuppyCoderViewModel = viewModel()) {
     val chatSync by viewModel.chatSync.collectAsState()
     val chatSearchQuery by viewModel.chatSearchQuery.collectAsState()
     val historyPaging by viewModel.historyPaging.collectAsState()
+    val writerClaim by viewModel.writerClaim.collectAsState()
     val serverDiscovery by viewModel.serverDiscovery.collectAsState()
+    val tunnelTests by viewModel.tunnelTests.collectAsState()
+    val sshConnectionTests by viewModel.sshConnectionTests.collectAsState()
     val chatSortOrder by viewModel.chatSortOrder.collectAsState()
     val chatGroupMode by viewModel.chatGroupMode.collectAsState()
     val collapsedChatGroups by viewModel.collapsedChatGroups.collectAsState()
@@ -181,6 +199,10 @@ fun RelayApp(viewModel: PuppyCoderViewModel = viewModel()) {
     var computerDraft by remember { mutableStateOf<RelayServer?>(null) }
     var showAddTunnel by rememberSaveable { mutableStateOf(false) }
     var tunnelDraftId by rememberSaveable { mutableStateOf<String?>(null) }
+    var showIdentityEditor by rememberSaveable { mutableStateOf(false) }
+    var identityDraftId by rememberSaveable { mutableStateOf<String?>(null) }
+    var showSshConnectionEditor by rememberSaveable { mutableStateOf(false) }
+    var sshConnectionDraftId by rememberSaveable { mutableStateOf<String?>(null) }
     var addRouteTunnelId by rememberSaveable { mutableStateOf<String?>(null) }
     var showChatArrangement by rememberSaveable { mutableStateOf(false) }
     var showUpdatePrompt by rememberSaveable { mutableStateOf(false) }
@@ -230,6 +252,12 @@ fun RelayApp(viewModel: PuppyCoderViewModel = viewModel()) {
         searchActive = false
         viewModel.setChatSearchQuery("")
     }
+    BackHandler(enabled = conversation == null && screen == MainScreen.IDENTITIES) {
+        screen = MainScreen.SETTINGS
+    }
+    BackHandler(enabled = conversation == null && screen == MainScreen.CONNECTIONS) {
+        screen = MainScreen.SETTINGS
+    }
     BackHandler(enabled = conversation == null && screen == MainScreen.SETTINGS) {
         screen = MainScreen.CHATS
     }
@@ -250,7 +278,11 @@ fun RelayApp(viewModel: PuppyCoderViewModel = viewModel()) {
             onLoadModels = viewModel::loadModels,
             onSelectModel = viewModel::selectModel,
             historyPaging = historyPaging,
+            writerClaim = writerClaim,
             onLoadOlder = viewModel::loadOlderMessages,
+            onShowWriterClaim = viewModel::showWriterClaimDialog,
+            onDismissWriterClaim = viewModel::dismissWriterClaim,
+            onForceClaimWriter = viewModel::forceClaimWriter,
             onScrollStateChanged = viewModel::setChatScrollInProgress,
             onViewportAtLatestChanged = viewModel::setChatViewportAtLatest,
             onOpenRemoteFile = { reference, allowOutsideWorkspace ->
@@ -280,13 +312,19 @@ fun RelayApp(viewModel: PuppyCoderViewModel = viewModel()) {
             topBar = {
                 Column {
                     AppHeader(
-                        showingSettings = screen == MainScreen.SETTINGS,
+                        showingSettings = screen != MainScreen.CHATS,
+                        settingsCloseDescription = if (screen in setOf(MainScreen.IDENTITIES, MainScreen.CONNECTIONS)) "Back to computers" else "Back to chats",
                         onSortClick = { showChatArrangement = true },
                         onSearchClick = { searchActive = true },
                         onSettingsClick = {
                             searchActive = false
                             viewModel.setChatSearchQuery("")
-                            screen = if (screen == MainScreen.SETTINGS) MainScreen.CHATS else MainScreen.SETTINGS
+                            screen = when (screen) {
+                                MainScreen.CHATS -> MainScreen.SETTINGS
+                                MainScreen.IDENTITIES -> MainScreen.SETTINGS
+                                MainScreen.CONNECTIONS -> MainScreen.SETTINGS
+                                MainScreen.SETTINGS -> MainScreen.CHATS
+                            }
                         },
                     )
                     UpdateBanner(
@@ -304,10 +342,30 @@ fun RelayApp(viewModel: PuppyCoderViewModel = viewModel()) {
             floatingActionButton = {
                 ExtendedFloatingActionButton(
                     onClick = {
-                        if (screen == MainScreen.CHATS) startNewChat() else openTunnelEditor(null)
+                        when (screen) {
+                            MainScreen.CHATS -> startNewChat()
+                            MainScreen.IDENTITIES -> {
+                                identityDraftId = null
+                                showIdentityEditor = true
+                            }
+                            MainScreen.CONNECTIONS -> {
+                                sshConnectionDraftId = null
+                                showSshConnectionEditor = true
+                            }
+                            MainScreen.SETTINGS -> openTunnelEditor(null)
+                        }
                     },
                     icon = { Icon(Icons.Default.Add, contentDescription = null) },
-                    text = { Text(if (screen == MainScreen.CHATS) "New chat" else "Add computer") },
+                    text = {
+                        Text(
+                            when (screen) {
+                                MainScreen.CHATS -> "New chat"
+                                MainScreen.IDENTITIES -> "Add identity"
+                                MainScreen.CONNECTIONS -> "Add SSH connection"
+                                MainScreen.SETTINGS -> "Add computer"
+                            },
+                        )
+                    },
                 )
             },
         ) { padding ->
@@ -333,6 +391,9 @@ fun RelayApp(viewModel: PuppyCoderViewModel = viewModel()) {
                 MainScreen.SETTINGS -> ComputersScreen(
                     computers = computers,
                     tunnels = tunnels,
+                    identityCount = identities.size,
+                    sshConnectionCount = sshConnections.size,
+                    tunnelTests = tunnelTests,
                     modifier = Modifier.padding(padding),
                     onTest = viewModel::testComputer,
                     onEdit = { openAddComputer(it) },
@@ -345,6 +406,36 @@ fun RelayApp(viewModel: PuppyCoderViewModel = viewModel()) {
                     onDeleteRoute = viewModel::deleteTunnelRoute,
                     onAddTunnel = { openTunnelEditor(null) },
                     onAdd = { openTunnelEditor(null) },
+                    onOpenIdentities = { screen = MainScreen.IDENTITIES },
+                    onOpenConnections = { screen = MainScreen.CONNECTIONS },
+                )
+                MainScreen.IDENTITIES -> IdentitiesScreen(
+                    identities = identities,
+                    modifier = Modifier.padding(padding),
+                    onEdit = { identity ->
+                        identityDraftId = identity.id
+                        showIdentityEditor = true
+                    },
+                    onDelete = viewModel::deleteIdentity,
+                    onAdd = {
+                        identityDraftId = null
+                        showIdentityEditor = true
+                    },
+                )
+                MainScreen.CONNECTIONS -> SshConnectionsScreen(
+                    connections = sshConnections,
+                    tests = sshConnectionTests,
+                    modifier = Modifier.padding(padding),
+                    onTest = viewModel::testSshConnection,
+                    onEdit = { connection ->
+                        sshConnectionDraftId = connection.id
+                        showSshConnectionEditor = true
+                    },
+                    onDelete = viewModel::deleteSshConnection,
+                    onAdd = {
+                        sshConnectionDraftId = null
+                        showSshConnectionEditor = true
+                    },
                 )
             }
         }
@@ -386,6 +477,11 @@ fun RelayApp(viewModel: PuppyCoderViewModel = viewModel()) {
         val initial = tunnelDraftId?.let { id -> tunnels.firstOrNull { it.id == id } }
         AddTunnelSheet(
             initial = initial,
+            connections = sshConnections,
+            onAddConnection = {
+                sshConnectionDraftId = null
+                showSshConnectionEditor = true
+            },
             onDismiss = {
                 showAddTunnel = false
                 tunnelDraftId = null
@@ -394,6 +490,39 @@ fun RelayApp(viewModel: PuppyCoderViewModel = viewModel()) {
                 showAddTunnel = false
                 tunnelDraftId = null
                 if (editingTunnel) viewModel.saveTunnel(it) else viewModel.saveTunnelAndDiscover(it)
+            },
+        )
+    }
+
+    if (showIdentityEditor) {
+        val initialIdentity = identityDraftId?.let { id -> identities.firstOrNull { it.id == id } }
+        AddIdentitySheet(
+            initial = initialIdentity,
+            onDismiss = {
+                showIdentityEditor = false
+                identityDraftId = null
+            },
+            onSave = {
+                showIdentityEditor = false
+                identityDraftId = null
+                viewModel.saveIdentity(it)
+            },
+        )
+    }
+
+    if (showSshConnectionEditor) {
+        val initialConnection = sshConnectionDraftId?.let { id -> sshConnections.firstOrNull { it.id == id } }
+        AddSshConnectionSheet(
+            initial = initialConnection,
+            identities = identities,
+            onDismiss = {
+                showSshConnectionEditor = false
+                sshConnectionDraftId = null
+            },
+            onSave = {
+                showSshConnectionEditor = false
+                sshConnectionDraftId = null
+                viewModel.saveSshConnection(it)
             },
         )
     }
@@ -517,6 +646,7 @@ private fun AppHeader(
     onSortClick: () -> Unit,
     onSearchClick: () -> Unit,
     onSettingsClick: () -> Unit,
+    settingsCloseDescription: String = "Back to chats",
 ) {
     Surface(shadowElevation = 1.dp) {
         Row(
@@ -549,7 +679,7 @@ private fun AppHeader(
             IconButton(onClick = onSettingsClick) {
                 Icon(
                     imageVector = if (showingSettings) Icons.Default.Close else Icons.Default.Settings,
-                    contentDescription = if (showingSettings) "Back to chats" else "Settings",
+                    contentDescription = if (showingSettings) settingsCloseDescription else "Settings",
                 )
             }
         }
@@ -830,7 +960,11 @@ private fun ConversationScreen(
     onLoadModels: (String, Boolean) -> Unit,
     onSelectModel: (AgentModel?) -> Unit,
     historyPaging: HistoryPagingState,
+    writerClaim: WriterClaimState,
     onLoadOlder: () -> Unit,
+    onShowWriterClaim: () -> Unit,
+    onDismissWriterClaim: () -> Unit,
+    onForceClaimWriter: () -> Unit,
     onScrollStateChanged: (Boolean) -> Unit,
     onViewportAtLatestChanged: (Boolean) -> Unit,
     onOpenRemoteFile: (String, Boolean) -> Unit,
@@ -875,6 +1009,29 @@ private fun ConversationScreen(
             layout.totalItemsCount == 0 ||
                 (layout.visibleItemsInfo.lastOrNull()?.index ?: 0) >= layout.totalItemsCount - 2
         }
+    }
+
+    if (writerClaim.conversationId == conversation.id && writerClaim.dialogVisible) {
+        AlertDialog(
+            onDismissRequest = onDismissWriterClaim,
+            title = { Text("Another client is writing") },
+            text = {
+                Text(
+                    "Live updates are being handled by another client. Claiming the writer may interrupt it. " +
+                        (writerClaim.message?.takeIf { it.isNotBlank() }?.let { "\n\n$it" } ?: ""),
+                )
+            },
+            dismissButton = {
+                TextButton(onClick = onDismissWriterClaim, enabled = !writerClaim.claiming) {
+                    Text("Keep watching")
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = onForceClaimWriter, enabled = !writerClaim.claiming) {
+                    Text(if (writerClaim.claiming) "Claiming..." else "Claim writer")
+                }
+            },
+        )
     }
 
     LaunchedEffect(listState.isScrollInProgress) {
@@ -971,6 +1128,15 @@ private fun ConversationScreen(
                                     color = if (busy) MaterialTheme.colorScheme.onSurfaceVariant else RelayGreen,
                                 )
                                 if (!busy) Text(" ▾", color = RelayGreen, style = MaterialTheme.typography.labelMedium)
+                            }
+                        }
+                        if (writerClaim.conversationId == conversation.id) {
+                            IconButton(onClick = onShowWriterClaim) {
+                                Icon(
+                                    Icons.Default.Lock,
+                                    contentDescription = "Read-only: another client is writing. Tap to claim the writer.",
+                                    tint = RelayAmber,
+                                )
                             }
                         }
                         if (busy) {
@@ -1876,6 +2042,9 @@ private fun previewSampleSize(width: Int, height: Int): Int {
 private fun ComputersScreen(
     computers: List<RelayServer>,
     tunnels: List<SshTunnelProfile>,
+    identityCount: Int,
+    sshConnectionCount: Int,
+    tunnelTests: Map<String, TunnelTestState>,
     modifier: Modifier,
     onTest: (String) -> Unit,
     onEdit: (RelayServer) -> Unit,
@@ -1888,19 +2057,30 @@ private fun ComputersScreen(
     onDeleteRoute: (String, TunnelRouteRule) -> Unit,
     onAddTunnel: () -> Unit,
     onAdd: () -> Unit,
+    onOpenIdentities: () -> Unit,
+    onOpenConnections: () -> Unit,
 ) {
     LazyColumn(
         modifier = modifier.fillMaxSize(),
         contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 96.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        item { PageHeading("SSH machines and their agents", "Computers") }
-        if (tunnels.isEmpty()) {
-            item {
-                Column(Modifier.padding(horizontal = 20.dp)) {
-                    Text("No SSH computers configured.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    TextButton(onClick = onAdd) { Text("Add SSH computer") }
-                }
+        item { PageHeading("Credentials, connections, and agent routes", "Computers") }
+        item {
+            Column(
+                modifier = Modifier.padding(horizontal = 20.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                SettingsPanel(
+                    title = "SSH connections",
+                    detail = "$sshConnectionCount saved address${if (sshConnectionCount == 1) "" else "es"} and host keys",
+                    onClick = onOpenConnections,
+                )
+                SettingsPanel(
+                    title = "Identities",
+                    detail = "$identityCount saved password${if (identityCount == 1) "" else "s"} or private keys",
+                    onClick = onOpenIdentities,
+                )
             }
         }
         item {
@@ -1909,20 +2089,20 @@ private fun ComputersScreen(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Column(Modifier.weight(1f)) {
-                    Text("SSH computers", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                    Text("Agent services are discovered automatically", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text("Agent routes", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                    Text("Choose saved SSH connections to build each route", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 OutlinedButton(onClick = onAddTunnel) {
                     Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(17.dp))
                     Spacer(Modifier.width(5.dp))
-                    Text("Add")
+                    Text("Add route")
                 }
             }
         }
         if (tunnels.isEmpty()) {
             item {
                 Text(
-                    "Add a computer using its SSH address and PuppyCoder will look for Codex and OpenCode.",
+                    "Add an agent route, then select the SSH connections it should use.",
                     modifier = Modifier.padding(horizontal = 20.dp),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -1932,6 +2112,7 @@ private fun ComputersScreen(
         items(tunnels, key = SshTunnelProfile::id) { tunnel ->
             TunnelCard(
                 tunnel = tunnel,
+                testState = tunnelTests[tunnel.id],
                 onTest = { onTestTunnel(tunnel.id) },
                 onDiscover = { onDiscoverTunnel(tunnel.id) },
                 onEdit = { onEditTunnel(tunnel) },
@@ -1969,8 +2150,30 @@ private fun ComputersScreen(
 }
 
 @Composable
+private fun SettingsPanel(
+    title: String,
+    detail: String,
+    onClick: () -> Unit,
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
+        shape = RoundedCornerShape(14.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = .7f),
+    ) {
+        Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text(title, fontWeight = FontWeight.SemiBold)
+                Text(detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            Icon(Icons.Default.ArrowForward, contentDescription = "Open $title", modifier = Modifier.size(18.dp), tint = RelayGreen)
+        }
+    }
+}
+
+@Composable
 private fun TunnelCard(
     tunnel: SshTunnelProfile,
+    testState: TunnelTestState?,
     onTest: () -> Unit,
     onDiscover: () -> Unit,
     onEdit: () -> Unit,
@@ -1990,7 +2193,23 @@ private fun TunnelCard(
                 Spacer(Modifier.width(11.dp))
                 Column(Modifier.weight(1f)) {
                     Text(tunnel.name, fontWeight = FontWeight.SemiBold)
-                    Text("${tunnel.ssh.username}@${tunnel.ssh.host}:${tunnel.ssh.port}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(
+                        tunnel.chainSummary(),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                if (tunnel.hops.size > 1) {
+                    Surface(shape = RoundedCornerShape(5.dp), color = MaterialTheme.colorScheme.secondaryContainer) {
+                        Text(
+                            "${tunnel.hops.size} hops",
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                            style = MaterialTheme.typography.labelSmall,
+                        )
+                    }
+                    Spacer(Modifier.width(6.dp))
                 }
                 Text("Priority ${tunnel.priority}", style = MaterialTheme.typography.labelSmall)
             }
@@ -2025,8 +2244,9 @@ private fun TunnelCard(
             }
             Spacer(Modifier.height(10.dp))
             Row {
-                OutlinedButton(onClick = onTest) {
-                    Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(17.dp))
+                OutlinedButton(onClick = onTest, enabled = testState?.loading != true) {
+                    if (testState?.loading == true) CircularProgressIndicator(Modifier.size(15.dp), strokeWidth = 2.dp)
+                    else Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(17.dp))
                     Spacer(Modifier.width(6.dp))
                     Text("Test tunnel")
                 }
@@ -2036,6 +2256,310 @@ private fun TunnelCard(
                     modifier = Modifier.semantics { contentDescription = "Edit SSH computer ${tunnel.name}" },
                 ) { Text("Edit") }
                 TextButton(onClick = onDelete) { Text("Delete", color = RelayRed) }
+            }
+            testState?.result?.let { result -> TunnelHopResults(result) }
+        }
+    }
+}
+
+@Composable
+private fun TunnelHopResults(result: SshTunnelTest) {
+    if (result.hops.isEmpty()) return
+    Spacer(Modifier.height(10.dp))
+    Text("Last test", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    result.hops.forEach { hop ->
+        Row(Modifier.fillMaxWidth().padding(vertical = 2.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(
+                if (hop.ok) Icons.Default.CheckCircle else Icons.Default.Close,
+                contentDescription = null,
+                modifier = Modifier.size(15.dp),
+                tint = if (hop.ok) RelayGreen else RelayRed,
+            )
+            Spacer(Modifier.width(7.dp))
+            Text(
+                "Hop ${hop.hopIndex + 1} · ${hop.label}",
+                modifier = Modifier.weight(1f),
+                style = MaterialTheme.typography.bodySmall,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                if (hop.ok) "${hop.latencyMs} ms" else "failed",
+                style = MaterialTheme.typography.labelSmall,
+                color = if (hop.ok) MaterialTheme.colorScheme.onSurfaceVariant else RelayRed,
+            )
+        }
+        hop.error?.let { error ->
+            Text(
+                error,
+                modifier = Modifier.padding(start = 22.dp),
+                style = MaterialTheme.typography.bodySmall,
+                color = RelayRed,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+private fun SshTunnelProfile.chainSummary(): String = if (hops.size == 1) {
+    "${ssh.username}@${ssh.host}:${ssh.port}"
+} else {
+    hops.joinToString(" → ") { hop ->
+        val who = hop.identityName.ifBlank { hop.username.ifBlank { "?" } }
+        "$who@${hop.host}"
+    }
+}
+
+@Composable
+private fun IdentitiesScreen(
+    identities: List<SshIdentity>,
+    modifier: Modifier,
+    onEdit: (SshIdentity) -> Unit,
+    onDelete: (String) -> Unit,
+    onAdd: () -> Unit,
+) {
+    LazyColumn(
+        modifier = modifier.fillMaxSize(),
+        contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 96.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        item { PageHeading("Reusable SSH credentials", "Identities") }
+        if (identities.isEmpty()) {
+            item {
+                Column(Modifier.padding(horizontal = 20.dp)) {
+                    Text("No identities saved yet.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(
+                        "An identity is a username with a password or private key. Hops can reuse it instead of repeating credentials.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    TextButton(onClick = onAdd) { Text("Add identity") }
+                }
+            }
+        }
+        items(identities, key = SshIdentity::id) { identity ->
+            IdentityCard(
+                identity = identity,
+                onEdit = { onEdit(identity) },
+                onDelete = { onDelete(identity.id) },
+            )
+        }
+    }
+}
+
+@Composable
+private fun IdentityCard(
+    identity: SshIdentity,
+    onEdit: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    Card(
+        modifier = Modifier.padding(horizontal = 20.dp).fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = .7f)),
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Surface(shape = RoundedCornerShape(10.dp), color = MaterialTheme.colorScheme.secondaryContainer) {
+                    Text(
+                        identity.kind.initials,
+                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 7.dp),
+                        color = RelayAmber,
+                        fontWeight = FontWeight.Black,
+                    )
+                }
+                Spacer(Modifier.width(11.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(identity.name, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        "${identity.kind.label} · ${identity.username}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                TextButton(onClick = onEdit) { Text("Edit") }
+                TextButton(onClick = onDelete) { Text("Delete", color = RelayRed) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SshConnectionsScreen(
+    connections: List<SshConnection>,
+    tests: Map<String, TunnelTestState>,
+    modifier: Modifier,
+    onTest: (String) -> Unit,
+    onEdit: (SshConnection) -> Unit,
+    onDelete: (String) -> Unit,
+    onAdd: () -> Unit,
+) {
+    LazyColumn(
+        modifier = modifier.fillMaxSize(),
+        contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 96.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        item { PageHeading("Reusable jump hosts", "SSH connections") }
+        if (connections.isEmpty()) {
+            item {
+                Column(Modifier.padding(horizontal = 20.dp)) {
+                    Text("No SSH connections saved yet.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(
+                        "Save an address and identity once, then select it in any SSH route.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    TextButton(onClick = onAdd) { Text("Add SSH connection") }
+                }
+            }
+        }
+        items(connections, key = SshConnection::id) { connection ->
+            val testState = tests[connection.id]
+            Card(
+                modifier = Modifier.padding(horizontal = 20.dp).fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = .7f)),
+            ) {
+                Column(Modifier.padding(16.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Surface(shape = RoundedCornerShape(10.dp), color = MaterialTheme.colorScheme.secondaryContainer) {
+                            Text("SSH", modifier = Modifier.padding(horizontal = 9.dp, vertical = 7.dp), color = RelayAmber, fontWeight = FontWeight.Black)
+                        }
+                        Spacer(Modifier.width(11.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(connection.name, fontWeight = FontWeight.SemiBold)
+                            Text(
+                                "${connection.ssh.host}:${connection.ssh.port} · " +
+                                    connection.ssh.identityName.ifBlank { connection.ssh.username },
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    }
+                    testState?.result?.let { result ->
+                        Text(
+                            "Connected · ${result.latencyMs} ms",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = RelayGreen,
+                            modifier = Modifier.padding(top = 8.dp),
+                        )
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        OutlinedButton(
+                            onClick = { onTest(connection.id) },
+                            enabled = testState?.loading != true,
+                        ) {
+                            if (testState?.loading == true) {
+                                CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp)
+                                Spacer(Modifier.width(8.dp))
+                                Text("Testing")
+                            } else {
+                                Text("Test connection")
+                            }
+                        }
+                        TextButton(onClick = { onEdit(connection) }) { Text("Edit") }
+                        TextButton(onClick = { onDelete(connection.id) }) { Text("Delete", color = RelayRed) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AddIdentitySheet(
+    initial: SshIdentity? = null,
+    onDismiss: () -> Unit,
+    onSave: (SshIdentity) -> Unit,
+) {
+    var name by rememberSaveable(initial?.id) { mutableStateOf(initial?.name.orEmpty()) }
+    var kind by rememberSaveable(initial?.id) { mutableStateOf(initial?.kind ?: SshIdentityKind.PASSWORD) }
+    var username by rememberSaveable(initial?.id) { mutableStateOf(initial?.username.orEmpty()) }
+    var password by rememberSaveable(initial?.id) { mutableStateOf(initial?.password.orEmpty()) }
+    var privateKey by rememberSaveable(initial?.id) { mutableStateOf(initial?.privateKey.orEmpty()) }
+    var privateKeyPassphrase by rememberSaveable(initial?.id) {
+        mutableStateOf(initial?.privateKeyPassphrase.orEmpty())
+    }
+    val credentialValid = when (kind) {
+        SshIdentityKind.PASSWORD -> password.isNotBlank()
+        SshIdentityKind.PRIVATE_KEY -> privateKey.isNotBlank()
+    }
+    val valid = name.isNotBlank() && username.isNotBlank() && credentialValid
+
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        LazyColumn(
+            modifier = Modifier
+                .padding(horizontal = 20.dp)
+                .semantics { contentDescription = "Identity editor fields" },
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 30.dp),
+        ) {
+            item {
+                SheetTitle(if (initial == null) "Add identity" else "Edit identity", onDismiss)
+                Text(
+                    "Saved credentials that SSH hops can share. Editing here updates every hop using this identity.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(10.dp))
+                AppTextField(name, { name = it }, "Identity name", "Work laptop key")
+                Text("Sign-in method", style = MaterialTheme.typography.labelLarge)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    SshIdentityKind.entries.forEach { option ->
+                        FilterChip(
+                            selected = kind == option,
+                            onClick = { kind = option },
+                            label = { Text(option.label) },
+                        )
+                    }
+                }
+                Spacer(Modifier.height(6.dp))
+                AppTextField(username, { username = it }, "SSH username", "puppy")
+                if (kind == SshIdentityKind.PASSWORD) {
+                    OutlinedTextField(
+                        value = password,
+                        onValueChange = { password = it },
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 5.dp),
+                        label = { Text("SSH password") },
+                        visualTransformation = PasswordVisualTransformation(),
+                        singleLine = true,
+                    )
+                } else {
+                    OutlinedTextField(
+                        value = privateKey,
+                        onValueChange = { privateKey = it },
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 5.dp),
+                        label = { Text("OpenSSH / PEM private key") },
+                        minLines = 2,
+                        maxLines = 5,
+                    )
+                    OutlinedTextField(
+                        value = privateKeyPassphrase,
+                        onValueChange = { privateKeyPassphrase = it },
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 5.dp),
+                        label = { Text("Private-key passphrase") },
+                        visualTransformation = PasswordVisualTransformation(),
+                        singleLine = true,
+                    )
+                }
+                Spacer(Modifier.height(16.dp))
+                Button(
+                    onClick = {
+                        onSave(
+                            SshIdentity(
+                                id = initial?.id ?: UUID.randomUUID().toString(),
+                                name = name.trim(),
+                                kind = kind,
+                                username = username.trim(),
+                                password = if (kind == SshIdentityKind.PASSWORD) password else "",
+                                privateKey = if (kind == SshIdentityKind.PRIVATE_KEY) privateKey else "",
+                                privateKeyPassphrase = privateKeyPassphrase,
+                            ),
+                        )
+                    },
+                    enabled = valid,
+                    modifier = Modifier.fillMaxWidth().height(50.dp),
+                ) { Text(if (initial == null) "Save identity" else "Save changes") }
             }
         }
     }
@@ -2330,21 +2854,17 @@ private fun AddComputerSheet(
 @Composable
 private fun AddTunnelSheet(
     initial: SshTunnelProfile? = null,
+    connections: List<SshConnection> = emptyList(),
+    onAddConnection: () -> Unit = {},
     onDismiss: () -> Unit,
     onSave: (SshTunnelProfile) -> Unit,
 ) {
     var name by rememberSaveable(initial?.id) { mutableStateOf(initial?.name.orEmpty()) }
-    var host by rememberSaveable(initial?.id) { mutableStateOf(initial?.ssh?.host.orEmpty()) }
-    var sshPort by rememberSaveable(initial?.id) { mutableStateOf((initial?.ssh?.port ?: 22).toString()) }
-    var username by rememberSaveable(initial?.id) { mutableStateOf(initial?.ssh?.username.orEmpty()) }
-    var password by rememberSaveable(initial?.id) { mutableStateOf(initial?.ssh?.password.orEmpty()) }
-    var privateKey by rememberSaveable(initial?.id) { mutableStateOf(initial?.ssh?.privateKey.orEmpty()) }
-    var privateKeyPassphrase by rememberSaveable(initial?.id) {
-        mutableStateOf(initial?.ssh?.privateKeyPassphrase.orEmpty())
+    var hops by rememberSaveable(initial?.id, stateSaver = hopListSaver) {
+        mutableStateOf(initial?.hops?.map(HopDraft::fromConfig) ?: listOf(HopDraft()))
     }
-    var fingerprint by rememberSaveable(initial?.id) {
-        mutableStateOf(initial?.ssh?.hostKeyFingerprint.orEmpty())
-    }
+    var expandedHop by rememberSaveable(initial?.id) { mutableStateOf<Int?>(0) }
+    var choosingHop by rememberSaveable(initial?.id) { mutableStateOf<Int?>(null) }
     var targets by rememberSaveable(initial?.id) {
         mutableStateOf(
             initial?.routes?.joinToString("\n") { it.displayNameForEditor() }
@@ -2353,13 +2873,16 @@ private fun AddTunnelSheet(
     }
     var priority by rememberSaveable(initial?.id) { mutableStateOf((initial?.priority ?: 100).toString()) }
     val parsedRoutes = remember(targets) { targets.parseTunnelRoutes() }
-    val valid = name.isNotBlank() && host.isNotBlank() && username.isNotBlank() &&
-        (password.isNotBlank() || privateKey.isNotBlank()) &&
-        sshPort.toIntOrNull() in 1..65535 && priority.toIntOrNull() != null && parsedRoutes.isNotEmpty()
+    val knownConnectionIds = remember(connections) { connections.map(SshConnection::id).toSet() }
+    val hopsValid = hops.all { it.isValid(knownConnectionIds) }
+    val valid = name.isNotBlank() && hopsValid && hops.isNotEmpty() &&
+        priority.toIntOrNull() != null && parsedRoutes.isNotEmpty()
 
     ModalBottomSheet(onDismissRequest = onDismiss) {
         LazyColumn(
-            modifier = Modifier.padding(horizontal = 20.dp),
+            modifier = Modifier
+                .padding(horizontal = 20.dp)
+                .semantics { contentDescription = "SSH computer editor fields" },
             contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 30.dp),
         ) {
             item {
@@ -2368,47 +2891,60 @@ private fun AddTunnelSheet(
                     if (initial == null) {
                         "Connect over SSH and PuppyCoder will automatically find Codex and OpenCode services."
                     } else {
-                        "Update this computer's SSH connection, credentials, routes, and priority."
+                        "Update this computer's SSH connection, jump hosts, routes, and priority."
                     },
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Spacer(Modifier.height(10.dp))
                 AppTextField(name, { name = it }, "Computer name", "Home workstation")
-                AppTextField(host, { host = it }, "SSH host", "gateway.example.com")
-                AppTextField(sshPort, { sshPort = it.filter(Char::isDigit) }, "SSH port", "22")
-                AppTextField(username, { username = it }, "SSH username", "puppy")
-                OutlinedTextField(
-                    value = password,
-                    onValueChange = { password = it },
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 5.dp),
-                    label = { Text("SSH password") },
-                    visualTransformation = PasswordVisualTransformation(),
-                    singleLine = true,
+                Spacer(Modifier.height(12.dp))
+            }
+            item(key = "chain") {
+                TunnelChainDiagram(
+                    hops = hops,
+                    selectedIndex = expandedHop,
+                    onHopSelected = { index -> expandedHop = if (expandedHop == index) null else index },
                 )
-                Text("Or use a private key", style = MaterialTheme.typography.labelLarge, modifier = Modifier.padding(top = 8.dp))
-                OutlinedTextField(
-                    value = privateKey,
-                    onValueChange = { privateKey = it },
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 5.dp),
-                    label = { Text("OpenSSH / PEM private key") },
-                    minLines = 2,
-                    maxLines = 5,
+                Spacer(Modifier.height(6.dp))
+            }
+            itemsIndexed(hops, key = { index, _ -> "hop-$index" }) { index, hop ->
+                HopEditorCard(
+                    hop = hop,
+                    index = index,
+                    total = hops.size,
+                    connections = connections,
+                    expanded = expandedHop == index,
+                    onToggle = { expandedHop = if (expandedHop == index) null else index },
+                    onChange = { updated ->
+                        hops = hops.toMutableList().also { it[index] = updated }
+                    },
+                    onChooseConnection = { choosingHop = index },
+                    onMove = { target ->
+                        if (target in hops.indices && target != index) {
+                            hops = hops.toMutableList().also { it.add(target, it.removeAt(index)) }
+                            expandedHop = target
+                        }
+                    },
+                    onRemove = {
+                        if (hops.size > 1) {
+                            hops = hops.filterIndexed { position, _ -> position != index }
+                            expandedHop = expandedHop?.coerceIn(0, hops.lastIndex)
+                        }
+                    },
                 )
-                OutlinedTextField(
-                    value = privateKeyPassphrase,
-                    onValueChange = { privateKeyPassphrase = it },
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 5.dp),
-                    label = { Text("Private-key passphrase") },
-                    visualTransformation = PasswordVisualTransformation(),
-                    singleLine = true,
-                )
-                AppTextField(fingerprint, { fingerprint = it }, "Host-key SHA-256 fingerprint", "SHA256:…")
-                if (fingerprint.isBlank()) {
-                    Text(
-                        "Without a fingerprint, the first connection cannot detect an impersonated SSH host.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = RelayAmber,
-                    )
+            }
+            item(key = "hop-actions") {
+                TextButton(
+                    onClick = {
+                        val targetIndex = hops.lastIndex
+                        hops = hops.toMutableList().also { it.add(targetIndex, HopDraft()) }
+                        expandedHop = targetIndex
+                    },
+                    modifier = Modifier.semantics { contentDescription = "Add jump host" },
+                ) {
+                    Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(17.dp))
+                    Spacer(Modifier.width(5.dp))
+                    Text("Add jump host")
                 }
                 Spacer(Modifier.height(8.dp))
                 OutlinedTextField(
@@ -2428,15 +2964,7 @@ private fun AddTunnelSheet(
                             SshTunnelProfile(
                                 id = initial?.id ?: UUID.randomUUID().toString(),
                                 name = name.trim(),
-                                ssh = SshTunnelConfig(
-                                    host = host.trim(),
-                                    port = checkNotNull(sshPort.toIntOrNull()),
-                                    username = username.trim(),
-                                    password = password,
-                                    privateKey = privateKey,
-                                    privateKeyPassphrase = privateKeyPassphrase,
-                                    hostKeyFingerprint = fingerprint.trim(),
-                                ),
+                                hops = hops.map(HopDraft::toConfig),
                                 routes = parsedRoutes,
                                 priority = checkNotNull(priority.toIntOrNull()),
                                 enabled = initial?.enabled ?: true,
@@ -2446,6 +2974,425 @@ private fun AddTunnelSheet(
                     enabled = valid,
                     modifier = Modifier.fillMaxWidth().height(50.dp),
                 ) { Text(if (initial == null) "Connect and discover" else "Save changes") }
+            }
+        }
+    }
+    choosingHop?.let { index ->
+        ChooseSshConnectionSheet(
+            connections = connections,
+            onDismiss = { choosingHop = null },
+            onChoose = { connection ->
+                hops = hops.toMutableList().also { list -> list[index] = HopDraft.fromConnection(connection) }
+                choosingHop = null
+            },
+            onAddConnection = {
+                choosingHop = null
+                onAddConnection()
+            },
+        )
+    }
+}
+
+private data class HopDraft(
+    val host: String = "",
+    val port: String = "22",
+    val username: String = "",
+    val password: String = "",
+    val privateKey: String = "",
+    val privateKeyPassphrase: String = "",
+    val hostKeyFingerprint: String = "",
+    val identityId: String? = null,
+    val connectionId: String? = null,
+    val connectionName: String = "",
+) {
+    fun isValid(knownConnectionIds: Set<String> = emptySet()): Boolean = connectionId in knownConnectionIds
+
+    fun summary(identityName: String? = null): String = when {
+        host.isBlank() -> "Not configured yet"
+        connectionName.isNotBlank() -> connectionName
+        identityName != null -> "$identityName@${host}:${port.ifBlank { "22" }}"
+        else -> "${username.ifBlank { "user" }}@${host}:${port.ifBlank { "22" }}"
+    }
+
+    fun toConfig() = SshTunnelConfig(
+        host = host.trim(),
+        port = checkNotNull(port.toIntOrNull()),
+        username = username.trim(),
+        password = password,
+        privateKey = privateKey,
+        privateKeyPassphrase = privateKeyPassphrase,
+        hostKeyFingerprint = hostKeyFingerprint.trim(),
+        identityId = identityId,
+        connectionId = connectionId,
+        connectionName = connectionName,
+    )
+
+    fun flatten(): List<String> = listOf(
+        host,
+        port,
+        username,
+        password,
+        privateKey,
+        privateKeyPassphrase,
+        hostKeyFingerprint,
+        identityId.orEmpty(),
+        connectionId.orEmpty(),
+        connectionName,
+    )
+
+    companion object {
+        const val FIELD_COUNT = 10
+
+        fun fromConfig(config: SshTunnelConfig) = HopDraft(
+            host = config.host,
+            port = config.port.toString(),
+            username = config.username,
+            password = config.password,
+            privateKey = config.privateKey,
+            privateKeyPassphrase = config.privateKeyPassphrase,
+            hostKeyFingerprint = config.hostKeyFingerprint,
+            identityId = config.identityId,
+            connectionId = config.connectionId,
+            connectionName = config.connectionName,
+        )
+
+        fun fromConnection(connection: SshConnection) = fromConfig(connection.ssh)
+
+        fun restore(fields: List<String>) = HopDraft(
+            host = fields.getOrElse(0) { "" },
+            port = fields.getOrElse(1) { "22" },
+            username = fields.getOrElse(2) { "" },
+            password = fields.getOrElse(3) { "" },
+            privateKey = fields.getOrElse(4) { "" },
+            privateKeyPassphrase = fields.getOrElse(5) { "" },
+            hostKeyFingerprint = fields.getOrElse(6) { "" },
+            identityId = fields.getOrNull(7)?.takeIf(String::isNotBlank),
+            connectionId = fields.getOrNull(8)?.takeIf(String::isNotBlank),
+            connectionName = fields.getOrElse(9) { "" },
+        )
+    }
+}
+
+private val hopListSaver = listSaver<List<HopDraft>, String>(
+    save = { list -> list.flatMap(HopDraft::flatten) },
+    restore = { flat -> flat.chunked(HopDraft.FIELD_COUNT).map { HopDraft.restore(it) } },
+)
+
+@Composable
+private fun TunnelChainDiagram(
+    hops: List<HopDraft>,
+    selectedIndex: Int?,
+    onHopSelected: (Int) -> Unit,
+) {
+    Column {
+        Text("Route", style = MaterialTheme.typography.labelLarge)
+        Text(
+            "Traffic jumps through each SSH machine in order before reaching agent services.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(8.dp))
+        Row(
+            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Surface(shape = RoundedCornerShape(8.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
+                Row(Modifier.padding(horizontal = 9.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Phone, contentDescription = null, modifier = Modifier.size(13.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text("Phone", style = MaterialTheme.typography.labelMedium)
+                }
+            }
+            hops.forEachIndexed { index, hop ->
+                Spacer(Modifier.width(4.dp))
+                Icon(
+                    Icons.Default.ArrowForward,
+                    contentDescription = null,
+                    modifier = Modifier.size(14.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.width(4.dp))
+                val selected = selectedIndex == index
+                Surface(
+                    shape = RoundedCornerShape(8.dp),
+                    color = if (selected) {
+                        MaterialTheme.colorScheme.secondaryContainer
+                    } else {
+                        MaterialTheme.colorScheme.surfaceVariant
+                    },
+                    border = if (selected) {
+                        BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
+                    } else {
+                        null
+                    },
+                    modifier = Modifier
+                        .semantics { contentDescription = "Route hop ${index + 1} ${hop.host}" }
+                        .clickable { onHopSelected(index) },
+                ) {
+                    Row(Modifier.padding(horizontal = 9.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Surface(shape = CircleShape, color = MaterialTheme.colorScheme.primary.copy(alpha = .16f)) {
+                            Text(
+                                "${index + 1}",
+                                modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp),
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                            )
+                        }
+                        Spacer(Modifier.width(5.dp))
+                        Text(
+                            hop.host.ifBlank { "Hop ${index + 1}" },
+                            style = MaterialTheme.typography.labelMedium,
+                            maxLines = 1,
+                            color = if (hop.host.isBlank()) RelayAmber else Color.Unspecified,
+                        )
+                    }
+                }
+            }
+            Spacer(Modifier.width(4.dp))
+            Icon(
+                Icons.Default.ArrowForward,
+                contentDescription = null,
+                modifier = Modifier.size(14.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.width(4.dp))
+            Surface(
+                shape = RoundedCornerShape(8.dp),
+                color = MaterialTheme.colorScheme.surface,
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+            ) {
+                Row(Modifier.padding(horizontal = 9.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Search, contentDescription = null, modifier = Modifier.size(13.dp), tint = RelayGreen)
+                    Spacer(Modifier.width(4.dp))
+                    Text("Target", style = MaterialTheme.typography.labelMedium)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun HopEditorCard(
+    hop: HopDraft,
+    index: Int,
+    total: Int,
+    connections: List<SshConnection>,
+    expanded: Boolean,
+    onToggle: () -> Unit,
+    onChange: (HopDraft) -> Unit,
+    onChooseConnection: () -> Unit,
+    onMove: (Int) -> Unit,
+    onRemove: () -> Unit,
+) {
+    val title = when {
+        total == 1 -> "SSH machine"
+        index == 0 -> "Hop 1 · entry"
+        index == total - 1 -> "Hop ${index + 1} · final"
+        else -> "Hop ${index + 1}"
+    }
+    val selectedConnection = connections.firstOrNull { it.id == hop.connectionId }
+    val summary = selectedConnection?.let { "${it.name} · ${it.ssh.host}:${it.ssh.port}" } ?: "Choose an SSH connection"
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = .55f),
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+    ) {
+        Column {
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .clickable(onClick = onToggle)
+                    .padding(horizontal = 12.dp, vertical = 8.dp)
+                    .semantics { contentDescription = "$title $summary" },
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(title, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        summary,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                if (selectedConnection == null) {
+                    Box(Modifier.size(8.dp).background(RelayAmber, CircleShape))
+                    Spacer(Modifier.width(8.dp))
+                }
+                if (selectedConnection != null) {
+                    Surface(shape = RoundedCornerShape(5.dp), color = MaterialTheme.colorScheme.secondaryContainer) {
+                        Text(
+                            "SSH",
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                            style = MaterialTheme.typography.labelSmall,
+                        )
+                    }
+                    Spacer(Modifier.width(8.dp))
+                }
+                Icon(
+                    if (expanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                    contentDescription = null,
+                    modifier = Modifier.size(20.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (expanded) {
+                Column(Modifier.padding(horizontal = 12.dp).padding(bottom = 12.dp)) {
+                    if (total > 1) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            TextButton(onClick = { onMove(index - 1) }, enabled = index > 0) {
+                                Icon(Icons.Default.KeyboardArrowUp, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(3.dp))
+                                Text("Move up")
+                            }
+                            TextButton(onClick = { onMove(index + 1) }, enabled = index < total - 1) {
+                                Icon(Icons.Default.KeyboardArrowDown, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(Modifier.width(3.dp))
+                                Text("Move down")
+                            }
+                            Spacer(Modifier.weight(1f))
+                            TextButton(onClick = onRemove) { Text("Remove", color = RelayRed) }
+                        }
+                    }
+                    Button(onClick = onChooseConnection, modifier = Modifier.fillMaxWidth()) {
+                        Icon(Icons.Default.Search, contentDescription = null, modifier = Modifier.size(17.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text(if (selectedConnection == null) "Choose SSH connection" else "Change SSH connection")
+                    }
+                    selectedConnection?.let { connection ->
+                        Spacer(Modifier.height(8.dp))
+                        Text(connection.ssh.host + ":" + connection.ssh.port, style = MaterialTheme.typography.bodySmall)
+                        Text(
+                            connection.ssh.identityName.ifBlank { connection.ssh.username },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ChooseSshConnectionSheet(
+    connections: List<SshConnection>,
+    onDismiss: () -> Unit,
+    onChoose: (SshConnection) -> Unit,
+    onAddConnection: () -> Unit,
+) {
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        LazyColumn(
+            modifier = Modifier.padding(horizontal = 20.dp),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 30.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            item {
+                SheetTitle("Choose SSH connection", onDismiss)
+                Text(
+                    "Jump hosts are reusable connections. Editing one updates every route that uses it.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Spacer(Modifier.height(10.dp))
+                OutlinedButton(onClick = onAddConnection, modifier = Modifier.fillMaxWidth()) {
+                    Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(17.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Add SSH connection")
+                }
+            }
+            if (connections.isEmpty()) {
+                item {
+                    Text("No SSH connections saved yet.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+            items(connections, key = SshConnection::id) { connection ->
+                Surface(
+                    modifier = Modifier.fillMaxWidth().clickable { onChoose(connection) },
+                    shape = RoundedCornerShape(12.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant,
+                ) {
+                    Column(Modifier.padding(12.dp)) {
+                        Text(connection.name, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "${connection.ssh.host}:${connection.ssh.port} · " +
+                                connection.ssh.identityName.ifBlank { connection.ssh.username },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AddSshConnectionSheet(
+    initial: SshConnection? = null,
+    identities: List<SshIdentity>,
+    onDismiss: () -> Unit,
+    onSave: (SshConnection) -> Unit,
+) {
+    var name by rememberSaveable(initial?.id) { mutableStateOf(initial?.name.orEmpty()) }
+    var host by rememberSaveable(initial?.id) { mutableStateOf(initial?.ssh?.host.orEmpty()) }
+    var port by rememberSaveable(initial?.id) { mutableStateOf((initial?.ssh?.port ?: 22).toString()) }
+    var fingerprint by rememberSaveable(initial?.id) { mutableStateOf(initial?.ssh?.hostKeyFingerprint.orEmpty()) }
+    var identityId by rememberSaveable(initial?.id) { mutableStateOf(initial?.ssh?.identityId) }
+    val selectedIdentity = identities.firstOrNull { it.id == identityId }
+    val valid = name.isNotBlank() && host.isNotBlank() && port.toIntOrNull() in 1..65535 && selectedIdentity != null
+
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        LazyColumn(
+            modifier = Modifier.padding(horizontal = 20.dp),
+            contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 30.dp),
+        ) {
+            item {
+                SheetTitle(if (initial == null) "Add SSH connection" else "Edit SSH connection", onDismiss)
+                Text("An address and an identity. Tunnel paths select these saved connections as jump hosts.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(Modifier.height(10.dp))
+                AppTextField(name, { name = it }, "Connection name", "Office gateway")
+                AppTextField(host, { host = it }, "SSH host", "gateway.example.com")
+                AppTextField(port, { port = it.filter(Char::isDigit) }, "SSH port", "22")
+                Text("Identity", style = MaterialTheme.typography.labelLarge)
+                Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    identities.forEach { identity ->
+                        FilterChip(
+                            selected = identityId == identity.id,
+                            onClick = { identityId = identity.id },
+                            label = { Text(identity.name) },
+                        )
+                    }
+                }
+                if (identities.isEmpty()) {
+                    Text("Add an identity first to use this connection.", style = MaterialTheme.typography.bodySmall, color = RelayAmber)
+                } else {
+                    selectedIdentity?.let { identity ->
+                        Text("${identity.username} · ${identity.kind.label}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+                AppTextField(fingerprint, { fingerprint = it }, "Host-key SHA-256 fingerprint", "SHA256:…")
+                Spacer(Modifier.height(16.dp))
+                Button(
+                    onClick = {
+                        onSave(
+                            SshConnection(
+                                id = initial?.id ?: UUID.randomUUID().toString(),
+                                name = name.trim(),
+                                ssh = SshTunnelConfig(
+                                    host = host.trim(),
+                                    port = checkNotNull(port.toIntOrNull()),
+                                    identityId = checkNotNull(identityId),
+                                    hostKeyFingerprint = fingerprint.trim(),
+                                ),
+                            ),
+                        )
+                    },
+                    enabled = valid,
+                    modifier = Modifier.fillMaxWidth().height(50.dp),
+                ) { Text(if (initial == null) "Save SSH connection" else "Save changes") }
             }
         }
     }
